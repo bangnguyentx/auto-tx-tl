@@ -9,9 +9,6 @@
 # DO NOT upload your token to public repos. Use environment variables in production.
 # -------------------------------------------------------------
 
-# ---------------------------
-# 📌 IMPORT THƯ VIỆN CHÍNH
-# ---------------------------
 import asyncio
 import logging
 import threading
@@ -26,22 +23,14 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------------------
 # 📌 FAKE PORT ĐỂ RENDER KHÔNG KILL
-# ---------------------------
 def keep_port_open():
     PORT = 10000
     Handler = http.server.SimpleHTTPRequestHandler
     with socketserver.TCPServer(("", PORT), Handler) as httpd:
         httpd.serve_forever()
 
-threading.Thread(target=keep_port_open, daemon=True).start()
-
-# ---------------------------
-# 📌 CÁC ĐOẠN CODE KHỞI TẠO BOT Ở DƯỚI
-# ---------------------------
-
-BOT_TOKEN = 7969189609:AAFG1-vmQEC_4nfgieG1fhUdWTWA8AsJt1I   # Token thật của bạn
+threading.Thread(target=keep_port_open, daemon=True).start()   # Token thật của bạn
 
 # Các hàm như init_db(), on_startup(), handler... nằm dưới đây
 import os
