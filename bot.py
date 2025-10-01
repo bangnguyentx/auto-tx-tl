@@ -1,825 +1,907 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Bot Tài Xỉu chuyên nghiệp - single file
-Tính năng:
-- Khi được add vào nhóm: admin phải cấp phép nhóm cho bot chạy
-- /batdau trong nhóm -> bot bắt đầu chạy phiên 45s
-- Người chơi cược: /T1000 (Tài) hoặc /X1000 (Xỉu)
-- Hũ (pot) được cộng theo quy tắc ở phần "Lưu ý"
-- Triple 1 hoặc triple 6 -> chia hũ cho người thắng ở phiên đó
-- Admin commands (riêng tư chat với bot): /allowgroup, /denygroup, /KqTai, /KqXiu, /bettai, /betxiu, /tatbet, /addmoney, /top10, xử lý rút tiền
-- Khi crash bot sẽ báo cho admin
-"""
+# bot.py
+# Telegram Tài Xỉu Bot — Hoàn chỉnh, nhiều chú giải, phù hợp deploy Render (worker)
+# - Phiên: 60 giây
+# - Lưu: SQLite
+# - Admins: có quyền duyệt nhóm, ép kết quả, bật/tắt cầu bệt, add tiền, xử lý rút tiền
+# - Người chơi: /start (tặng 10k), /T1000 /X500, /ruttien ...
+# -------------------------------------------------------------
+# IMPORTANT: Replace BOT_TOKEN below with your bot token before running.
+# DO NOT upload your token to public repos. Use environment variables in production.
+# -------------------------------------------------------------
 
 import os
-import asyncio
-import logging
+import sys
+import sqlite3
 import random
-import aiosqlite
-import signal
-from datetime import datetime
-from typing import Dict, List, Any, Optional
-from functools import wraps
+import math
+import traceback
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional, Dict, Any
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+    KeyboardButton, Chat, ChatPermissions
+)
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, Application, PicklePersistence
+)
 
-# -------------------------
-# Configuration (ENV)
-# -------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-DB_FILE = os.getenv("DB_FILE", "./data/bot.db")
-ROUND_INTERVAL = int(os.getenv("ROUND_INTERVAL", "45"))  # seconds
-PAYOUT_MULTIPLIER = 1.97
-POT_FEE_RATIO = 0.3  # 0.3 * bet => chuyển vào hũ khi người thắng (theo yêu cầu)
-# -------------------------
+# -----------------------
+# CONFIGURATION
+# -----------------------
 
-# Basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("taixiu-bot")
+# *** SECURITY: Put your token here BEFORE running, or better use environment variable.
+# Replace the string below with your actual token, or set BOT_TOKEN env variable and leave this placeholder.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN chưa được đặt. Hãy set biến môi trường BOT_TOKEN.")
-    raise SystemExit("BOT_TOKEN required")
+# Admin IDs (list) - you can update these IDs. These are the accounts that receive approval requests, crash alerts, and can use admin commands.
+ADMIN_IDS = [7760459637, 6942793864]  # <-- adjust if needed
 
-# -------------------------
-# DB helpers (sqlite async)
-# Tables:
-# - users: tg_id, balance, streak_win, total_wins
-# - groups: chat_id, allowed (0/1), running (0/1), last_started
-# - bets: session_id, chat_id, user_id, side, amount, result (nullable)
-# - history: chat_id, session_id, result, dice, created_at
-# - pot: total
-# - withdraws: id, user_id, bank_name, account_number, amount, status
-# -------------------------
-async def init_db():
-    os.makedirs(os.path.dirname(DB_FILE) or ".", exist_ok=True)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            tg_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            balance REAL DEFAULT 0,
-            streak_win INTEGER DEFAULT 0,
-            total_wins INTEGER DEFAULT 0,
-            total_bets REAL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS groups (
-            chat_id INTEGER PRIMARY KEY,
-            allowed INTEGER DEFAULT 0,
-            running INTEGER DEFAULT 0,
-            last_started TEXT
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            started_at TEXT,
-            forced_result TEXT DEFAULT NULL
-        );
-        CREATE TABLE IF NOT EXISTS bets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            chat_id INTEGER,
-            user_id INTEGER,
-            side TEXT, -- 'T' or 'X'
-            amount REAL,
-            resolved INTEGER DEFAULT 0,
-            won INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            session_id INTEGER,
-            result TEXT,
-            dice TEXT,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS pot (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            total REAL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS withdraws (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            bank_name TEXT,
-            account_number TEXT,
-            amount REAL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT
-        );
-        INSERT OR IGNORE INTO pot (id, total) VALUES (1, 0);
-        """)
-        await db.commit()
-    logger.info("DB initialized at %s", DB_FILE)
+# Round timing (seconds)
+ROUND_SECONDS = 60  # user requested 60s per round
 
-# -------------------------
-# Utilities
-# -------------------------
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user = update.effective_user
-        uid = user.id if user else None
-        if uid not in ADMIN_IDS:
-            if update.effective_chat and update.effective_chat.type == "private":
-                await update.message.reply_text("Bạn không có quyền admin.")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+# Minimal bet
+MIN_BET = 1000  # 1,000₫ minimal bet as you requested
 
-async def get_balance(db, tg_id: int) -> float:
-    cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
-    row = await cur.fetchone()
-    return float(row[0]) if row else 0.0
+# Initial free credit for new users on /start
+INITIAL_FREE = 10_000
 
-async def set_balance(db, tg_id: int, amount: float):
-    await db.execute("INSERT INTO users (tg_id, balance) VALUES (?, ?) ON CONFLICT(tg_id) DO UPDATE SET balance=excluded.balance", (tg_id, amount))
-    await db.commit()
+# Winning payout multiplier and house share
+WIN_MULTIPLIER = 1.97
+HOUSE_RATE = 0.03  # 3% of winning goes to pot
 
-async def change_balance(db, tg_id: int, delta: float):
-    cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
-    row = await cur.fetchone()
-    if row:
-        new = float(row[0]) + delta
-        await db.execute("UPDATE users SET balance = ? WHERE tg_id = ?", (new, tg_id))
+# DB filename
+DB_FILE = "tx_bot_data.db"
+
+# Logging config
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Safety: prevent running with placeholder token
+if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
+    logger.warning("BOT_TOKEN placeholder detected. Replace it with your actual token or set BOT_TOKEN env var before running.")
+    # Not exiting — allow user to edit file locally. If running on server, will likely fail auth.
+
+# -----------------------
+# DATABASE SETUP
+# -----------------------
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # users: track balance, streaks, totals
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        balance REAL DEFAULT 0,
+        total_deposited REAL DEFAULT 0,
+        total_bet_volume REAL DEFAULT 0,
+        current_streak INTEGER DEFAULT 0,
+        best_streak INTEGER DEFAULT 0,
+        created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS groups (
+        chat_id INTEGER PRIMARY KEY,
+        title TEXT,
+        approved INTEGER DEFAULT 0,
+        running INTEGER DEFAULT 0,
+        bet_mode TEXT DEFAULT 'random', -- 'random', 'bettai', 'betxiu', 'force_tai', 'force_xiu'
+        last_round INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS bets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        round_id TEXT,
+        user_id INTEGER,
+        side TEXT, -- 'tai' or 'xiu'
+        amount REAL,
+        timestamp TEXT
+    );
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        round_index INTEGER,
+        round_id TEXT,
+        result TEXT,
+        dice TEXT,
+        timestamp TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pot (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        amount REAL DEFAULT 0
+    );
+    """)
+    # ensure pot row exists
+    cur.execute("INSERT OR IGNORE INTO pot(id, amount) VALUES (1, 0)")
+    conn.commit()
+    conn.close()
+
+# Helper DB functions
+def db_execute(query: str, params: Tuple = ()):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+    lastrowid = cur.lastrowid
+    conn.close()
+    return lastrowid
+
+def db_query(query: str, params: Tuple = ()):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# -----------------------
+# UTILITIES
+# -----------------------
+
+def now_iso():
+    return datetime.utcnow().isoformat()
+
+def ensure_user(user_id: int, username: str = "", first_name: str = ""):
+    rows = db_query("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if not rows:
+        db_execute(
+            "INSERT INTO users(user_id, username, first_name, balance, total_deposited, total_bet_volume, current_streak, best_streak, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username or "", first_name or "", 0.0, 0.0, 0.0, 0, 0, now_iso())
+        )
+
+def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    rows = db_query("SELECT * FROM users WHERE user_id=?", (user_id,))
+    return dict(rows[0]) if rows else None
+
+def add_balance(user_id: int, amount: float):
+    u = get_user(user_id)
+    if not u:
+        ensure_user(user_id, "", "")
+        u = get_user(user_id)
+    new_bal = (u["balance"] or 0.0) + amount
+    db_execute("UPDATE users SET balance=? WHERE user_id=?", (new_bal, user_id))
+
+def set_balance(user_id: int, amount: float):
+    ensure_user(user_id, "", "")
+    db_execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user_id))
+
+def add_to_pot(amount: float):
+    rows = db_query("SELECT amount FROM pot WHERE id=1")
+    current = rows[0]["amount"] if rows else 0.0
+    new = current + amount
+    db_execute("UPDATE pot SET amount=? WHERE id=1", (new,))
+
+def get_pot_amount() -> float:
+    rows = db_query("SELECT amount FROM pot WHERE id=1")
+    return rows[0]["amount"] if rows else 0.0
+
+def reset_pot():
+    db_execute("UPDATE pot SET amount=? WHERE id=1", (0.0,))
+
+def send_admins(app: Application, text: str, reply_markup=None):
+    for aid in ADMIN_IDS:
+        try:
+            app.bot.send_message(chat_id=aid, text=text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.exception(f"Failed to notify admin {aid}: {e}")
+
+# -----------------------
+# DICE LOGIC
+# -----------------------
+
+def roll_three_dice() -> Tuple[List[int], int, Optional[str]]:
+    # Returns (dice_list, total, special_flag)
+    # special_flag: 'triple1' or 'triple6' or None
+    a = random.randint(1, 6)
+    b = random.randint(1, 6)
+    c = random.randint(1, 6)
+    dice = [a, b, c]
+    total = sum(dice)
+    if dice.count(1) == 3:
+        special = 'triple1'
+    elif dice.count(6) == 3:
+        special = 'triple6'
     else:
-        new = delta
-        await db.execute("INSERT INTO users (tg_id, balance) VALUES (?, ?)", (tg_id, new))
-    await db.commit()
-    return new
+        special = None
+    return dice, total, special
 
-async def add_to_pot(db, amount: float):
-    await db.execute("UPDATE pot SET total = total + ? WHERE id = 1", (amount,))
-    await db.commit()
-
-async def get_pot(db) -> float:
-    cur = await db.execute("SELECT total FROM pot WHERE id = 1")
-    r = await cur.fetchone()
-    return float(r[0]) if r else 0.0
-
-async def reset_pot(db):
-    await db.execute("UPDATE pot SET total = 0 WHERE id = 1")
-    await db.commit()
-
-# -------------------------
-# In-memory control for sessions per chat
-# -------------------------
-chat_tasks: Dict[int, asyncio.Task] = {}
-# forced results per chat: if set to 'T' or 'X' then next round result forced; cleared after used unless persistent forced_result in session.
-chat_forced_mode: Dict[int, Optional[str]] = {}  # 'T', 'X', or None
-# bet mode (bệt): None/'T'/'X' - if set, override random to repeated T or X until /tatbet
-chat_bet_mode: Dict[int, Optional[str]] = {}
-
-# -------------------------
-# Core game logic
-# -------------------------
-def roll_three_dice():
-    d = [random.randint(1,6) for _ in range(3)]
-    s = sum(d)
-    if d[0] == d[1] == d[2]:
-        triple = True
+def result_from_total(total: int) -> str:
+    # Tài: 11-17 ; Xỉu: 4-10
+    if 11 <= total <= 17:
+        return 'tai'
+    elif 4 <= total <= 10:
+        return 'xiu'
     else:
-        triple = False
-    # Tài if sum 11-17, Xỉu if 4-10
-    if 4 <= s <= 10:
-        side = 'X'  # Xỉu (Trắng)
-    elif 11 <= s <= 17:
-        side = 'T'  # Tài (Đen)
-    else:
-        side = 'X'  # shouldn't happen but default
-    return d, s, side, triple
+        return 'invalid'
 
-async def resolve_session(db, application: Application, chat_id: int, session_id: int, forced_result: Optional[str]=None):
-    """
-    Resolve bets in DB for given session_id
-    forced_result: 'T' or 'X' to override random (admin KqTai/KqXiu or bet mode)
-    """
-    # roll
-    if forced_result:
-        # if forced_result is 'T' -> make dice sum in 11-17 or triple logic
-        if forced_result == 'T':
-            # pick a random T sum (11-17) and craft dice if possible; simplest: roll until side==T
-            while True:
-                d, s, side, triple = roll_three_dice()
-                if side == 'T':
-                    break
-        else:
-            while True:
-                d, s, side, triple = roll_three_dice()
-                if side == 'X':
-                    break
-    else:
-        d, s, side, triple = roll_three_dice()
+# -----------------------
+# TELEGRAM HANDLERS
+# -----------------------
 
-    dice_str = ",".join(map(str,d))
-    result_text = "T" if side == 'T' else "X"
+# Keyboard menu for private chats
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("Game"), KeyboardButton("Nạp tiền")],
+        [KeyboardButton("Rút tiền"), KeyboardButton("Số dư")]
+    ],
+    resize_keyboard=True
+)
 
-    # Fetch bets for this session
-    cur = await db.execute("SELECT id, user_id, side, amount FROM bets WHERE session_id = ? AND resolved = 0", (session_id,))
-    bets = await cur.fetchall()
-
-    winners = []
-    losers = []
-    total_pot_add = 0.0
-
-    # compute payouts
-    for bet in bets:
-        bet_id, user_id, bside, amount = bet
-        amount = float(amount)
-        if bside == result_text:
-            # winner
-            # trích POT_FEE_RATIO * amount vào hũ, người thắng nhận PAYOUT_MULTIPLIER*amount - POT_FEE_RATIO*amount
-            fee = POT_FEE_RATIO * amount
-            payout = PAYOUT_MULTIPLIER * amount - fee
-            # apply to user balance
-            await change_balance(db, user_id, payout)
-            # update winner stats
-            await db.execute("UPDATE users SET streak_win = streak_win + 1, total_wins = total_wins + 1, total_bets = total_bets + ? WHERE tg_id = ?", (amount, user_id))
-            # mark bet resolved, won
-            await db.execute("UPDATE bets SET resolved = 1, won = 1 WHERE id = ?", (bet_id,))
-            winners.append((user_id, payout, amount))
-            total_pot_add += fee
-        else:
-            # loser: their bet added to pot
-            await db.execute("UPDATE bets SET resolved = 1, won = 0 WHERE id = ?", (bet_id,))
-            # subtract amount from user's balance (assuming already deducted at bet time)
-            # add to pot
-            total_pot_add += amount
-            # reset streak
-            await db.execute("UPDATE users SET streak_win = 0, total_bets = total_bets + ? WHERE tg_id = ?", (amount, user_id))
-            losers.append((user_id, amount))
-
-    await db.commit()
-    if total_pot_add > 0:
-        await add_to_pot(db, total_pot_add)
-
-    # Add to history
-    await db.execute("INSERT INTO history (chat_id, session_id, result, dice, created_at) VALUES (?, ?, ?, ?, ?)",
-                     (chat_id, session_id, result_text, dice_str, datetime.utcnow().isoformat()))
-    await db.commit()
-
-    # If triple 1 or triple 6 -> share pot among winners of that session
-    if d[0] == d[1] == d[2] and (d[0] == 1 or d[0] == 6):
-        # special share
-        pot_total = await get_pot(db)
-        if pot_total > 0 and winners:
-            share_each = pot_total / len(winners)
-            for (uid, _, _) in winners:
-                await change_balance(db, uid, share_each)
-            await reset_pot(db)
-            # notify admins about special distribution
-            for adm in ADMIN_IDS:
-                try:
-                    await application.bot.send_message(adm, f"Chia hũ {pot_total:.2f} cho {len(winners)} người thắng ở phiên {session_id} (triple {d[0]}). Mỗi người: {share_each:.2f}")
-                except Exception as e:
-                    logger.exception("Cannot notify admin about pot share: %s", e)
-
-    # Send result message to group
-    # Build summary
-    txt = f"🎲 Kết quả phiên #{session_id} — Dice: {dice_str} — Tổng: {s} — {'Tài (Đen)' if side=='T' else 'Xỉu (Trắng)'}\n"
-    if winners:
-        txt += f"Người thắng: {len(winners)}\n"
-    else:
-        txt += "Không có người thắng trong phiên này.\n"
-    pot_now = await get_pot(db)
-    txt += f"Hũ hiện tại: {pot_now:.2f}\n"
-
-    # send to group
-    try:
-        await application.bot.send_message(chat_id=chat_id, text=txt)
-    except Exception as e:
-        logger.exception("Không gửi được kết quả nhóm %s: %s", chat_id, e)
-
-    # After result, send history summary (last 10 results for the group)
-    cur2 = await db.execute("SELECT result, dice, created_at FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 10", (chat_id,))
-    his = await cur2.fetchall()
-    hist_txt = "Lịch sử (gần nhất -> cũ):\n"
-    for r in his:
-        rr, dd, ca = r
-        hist_txt += f"{'Đen' if rr=='T' else 'Trắng'} [{dd}] - {ca}\n"
-    try:
-        await application.bot.send_message(chat_id=chat_id, text=hist_txt)
-    except Exception:
-        pass
-
-# -------------------------
-# Session scheduler per chat
-# -------------------------
-async def chat_runner(application: Application, chat_id: int):
-    """
-    Runs rounds every ROUND_INTERVAL seconds while group's running flag is 1 and allowed = 1
-    Each round:
-    - create session, accept bets during waiting period (we assume bets placed between rounds using /T /X)
-    - after waiting, resolve bets
-    """
-    logger.info("Starting runner for chat %s", chat_id)
-    try:
-        async with aiosqlite.connect(DB_FILE) as db:
-            while True:
-                # check group allowed & running
-                cur = await db.execute("SELECT allowed, running FROM groups WHERE chat_id = ?", (chat_id,))
-                row = await cur.fetchone()
-                if not row or row[0] != 1 or row[1] != 1:
-                    logger.info("Group %s no longer allowed/running, stopping runner", chat_id)
-                    break
-                # create session
-                started_at = datetime.utcnow().isoformat()
-                await db.execute("INSERT INTO sessions (chat_id, started_at) VALUES (?, ?)", (chat_id, started_at))
-                await db.commit()
-                cur2 = await db.execute("SELECT last_insert_rowid()")
-                r = await cur2.fetchone()
-                session_id = r[0]
-                # inform group: phiên bắt đầu, mọi người đặt cược trong vòng ROUND_INTERVAL giây
-                try:
-                    await application.bot.send_message(chat_id=chat_id, text=f"🔔 Phiên #{session_id} bắt đầu! Bạn có {ROUND_INTERVAL} giây để cược. Gõ /T<amount> cho Tài hoặc /X<amount> cho Xỉu. Ví dụ: /T1000")
-                except Exception as e:
-                    logger.exception("Không gửi thông báo bắt đầu phiên: %s", e)
-
-                # wait for the interval, but allow forced admin Kq to set forced_result for next resolution
-                await asyncio.sleep(ROUND_INTERVAL)
-
-                # Check forced result mode or bet mode for this chat
-                forced = None
-                if chat_forced_mode.get(chat_id):
-                    forced = chat_forced_mode[chat_id]
-                    # clear one-time forced after using
-                    chat_forced_mode[chat_id] = None
-
-                # bet mode (bệt) may set repeated side
-                bet_mode = chat_bet_mode.get(chat_id)
-                if bet_mode:
-                    forced = bet_mode
-
-                # resolve session
-                await resolve_session(db, application, chat_id, session_id, forced_result=forced)
-
-                # continue to next round
-    except asyncio.CancelledError:
-        logger.info("Runner for chat %s cancelled", chat_id)
-    except Exception as e:
-        logger.exception("Runner crashed for chat %s: %s", chat_id, e)
-        # notify admins
-        for adm in ADMIN_IDS:
-            try:
-                await application.bot.send_message(adm, f"Bot bị lỗi ở runner nhóm {chat_id}: {e}")
-            except:
-                pass
-    finally:
-        chat_tasks.pop(chat_id, None)
-        logger.info("Runner stopped for chat %s", chat_id)
-
-# -------------------------
-# Command Handlers
-# -------------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if update.effective_chat.type != "private":
-        # in group, simple greet
-        await update.message.reply_text("Mình là bot Tài Xỉu. Dùng /batdau để bắt đầu phiên (yêu cầu nhóm đã được admin cấp phép).")
-        return
-    # private start: greet and give 10k free (10000 units)
-    async with aiosqlite.connect(DB_FILE) as db:
-        # create user if not exist
-        await db.execute("INSERT OR IGNORE INTO users (tg_id, username, first_name, last_name, balance) VALUES (?, ?, ?, ?, ?)",
-                         (user.id, user.username or "", user.first_name or "", user.last_name or "", 10000.0))
-        # if existed but balance 0, we may choose not to topup. Simpler: only give 10k on first start
-        # Check whether this is first time (streak as proxy)
-        cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (user.id,))
-        row = await cur.fetchone()
-        await db.commit()
-        await update.message.reply_text("Xin chào! Mình tặng bạn 10,000₫ (số ảo) để thử chơi. Gõ /menu để xem các tùy chọn.")
+    ensure_user(user.id, user.username or "", user.first_name or "")
+    u = get_user(user.id)
+    greeted = False
+    if u and (u["total_deposited"] == 0):
+        # Give initial free credit and mark as deposited to avoid re-gifting
+        add_balance(user.id, INITIAL_FREE)
+        db_execute("UPDATE users SET total_deposited=? WHERE user_id=?", (INITIAL_FREE, user.id))
+        greeted = True
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("Game & Hướng dẫn", callback_data="menu_game")],
-        [InlineKeyboardButton("Nạp tiền", callback_data="menu_topup")],
-        [InlineKeyboardButton("Rút tiền", callback_data="menu_withdraw")],
-        [InlineKeyboardButton("Số dư", callback_data="menu_balance")]
-    ]
-    await update.message.reply_text("Chọn một mục:", reply_markup=InlineKeyboardMarkup(kb))
+    # Friendly welcome message and menu
+    text = f"Xin chào {user.first_name or 'bạn'}! 👋\n\n"
+    text += "Chào mừng đến với bot Tài Xỉu tự động.\n"
+    if greeted:
+        text += f"Bạn đã được tặng {INITIAL_FREE:,}₫ miễn phí. Chúc chơi vui!\n\n"
+    text += "Menu:\n"
+    text += "- Game: thông tin & link nhóm\n"
+    text += "- Nạp tiền: hướng dẫn nạp\n"
+    text += "- Rút tiền: /ruttien <Ngân hàng> <Số TK> <Số tiền>\n"
+    text += "- Đặt cược trong nhóm: /T<amount> hoặc /X<amount>\n"
+    text += "\nBạn có thể dùng phím menu hoặc lệnh trực tiếp."
+    await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
-async def menu_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if data == "menu_game":
-        await q.edit_message_text("Game: Tài Xỉu. Link nhóm: @VET789cc\nCách chơi: Gõ /T<amount> cho Tài, /X<amount> cho Xỉu. Ví dụ /T1000\nPhiên chạy mỗi 45s.")
-    elif data == "menu_topup":
-        await q.edit_message_text("Nạp tiền: Liên hệ: @HOANGDUNGG789")
-    elif data == "menu_withdraw":
-        await q.edit_message_text("Rút tiền:\nĐể rút tiền hãy nhập lệnh:\n/ruttien <Ngân hàng của bạn> <Số tài khoản> <Số tiền>\nRút tối thiểu 100000 vnđ\nPhải cược 0.9 vòng cược")
-    elif data == "menu_balance":
-        async with aiosqlite.connect(DB_FILE) as db:
-            bal = await get_balance(db, q.from_user.id)
-        await q.edit_message_text(f"Số dư hiện tại: {bal:.2f}")
+async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text == "game":
+        return await game_info(update, context)
+    if text == "nạp tiền" or text == "nap tien" or text == "nạp":
+        return await nap_info(update, context)
+    if text == "rút tiền" or text == "rut tien":
+        return await ruttien_help(update, context)
+    if text == "số dư" or text == "so du":
+        u = get_user(update.effective_user.id)
+        bal = int(u["balance"]) if u else 0
+        await update.message.reply_text(f"Số dư hiện tại: {bal:,}₫")
+    # else ignore; catch other text elsewhere
 
-# Betting command: parse /T1000 or /X1000
-async def bet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text.strip()
+async def game_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "Game: Tài Xỉu (xúc xắc 3 con)\n\n"
+    text += "Luật chính:\n"
+    text += "- Tài: tổng 11-17 (Đen)\n- Xỉu: tổng 4-10 (Trắng)\n"
+    text += f"- Phiên chạy mỗi {ROUND_SECONDS} giây khi nhóm được admin duyệt & bật /batdau.\n"
+    text += f"- Thắng nhận x{WIN_MULTIPLIER} (house giữ {int(HOUSE_RATE*100)}% mỗi khoản thắng vào hũ).\n"
+    text += "- Nếu ra 3 con 1 hoặc 3 con 6 → hũ được chia cho những người thắng phiên đó theo tỉ lệ cược.\n\n"
+    text += "Link nhóm: @VET789cc\n"
+    text += "Giới thiệu: Đặt cược bằng lệnh /T<amount> hoặc /X<amount> trong nhóm khi bot đang chạy."
+    await update.message.reply_text(text)
+
+async def nap_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Để nạp tiền, liên hệ: @HOANGDUNGG789\nAdmin sẽ kiểm tra và cộng tiền thủ công hoặc bạn có thể dùng hệ thống nạp (nếu có).")
+
+async def ruttien_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Để rút tiền hãy nhập lệnh:\n"
+        "/ruttien <Ngân hàng> <Số tài khoản> <Số tiền>\n\n"
+        "Rút tối thiểu 100000 vnđ.\n"
+        "Bạn phải cược tối thiểu 0.9 vòng cược (0.9x tổng đã nạp).\n"
+    )
+    await update.message.reply_text(text)
+
+# Rút tiền command handler
+async def ruttien_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("Lệnh cược chỉ dùng trong nhóm.")
-        return
-    # parse
-    if msg[0].upper() == 'T':
-        side = 'T'
-        amt_str = msg[1:]
-    elif msg[0].upper() == 'X':
-        side = 'X'
-        amt_str = msg[1:]
-    else:
-        return
-    try:
-        amt = float(amt_str)
-        if amt <= 0:
-            raise ValueError()
-    except:
-        await update.message.reply_text("Sai cú pháp cược. Ví dụ: /T1000")
-        return
-
-    # check group allowed & running
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT allowed, running FROM groups WHERE chat_id = ?", (chat.id,))
-        row = await cur.fetchone()
-        if not row or row[0] != 1 or row[1] != 1:
-            await update.message.reply_text("Nhóm chưa bật game hoặc chưa được cấp phép.")
-            return
-        # get latest session for chat
-        cur2 = await db.execute("SELECT session_id FROM sessions WHERE chat_id = ? ORDER BY session_id DESC LIMIT 1", (chat.id,))
-        row2 = await cur2.fetchone()
-        if not row2:
-            await update.message.reply_text("Chưa có phiên để đặt cược, vui lòng chờ phiên tiếp theo.")
-            return
-        session_id = row2[0]
-        # check user balance
-        cur3 = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (user.id,))
-        r3 = await cur3.fetchone()
-        bal = float(r3[0]) if r3 else 0.0
-        if bal < amt:
-            await update.message.reply_text(f"Số dư không đủ. Hiện có: {bal:.2f}")
-            return
-        # deduct immediately
-        await change_balance(db, user.id, -amt)
-        # create bet
-        await db.execute("INSERT INTO bets (session_id, chat_id, user_id, side, amount) VALUES (?, ?, ?, ?, ?)",
-                         (session_id, chat.id, user.id, side, amt))
-        await db.commit()
-        await update.message.reply_text(f"Đặt cược {amt:.2f} cho {'Tài' if side=='T' else 'Xỉu'}. Chúc may mắn!")
-
-# /batdau in group - request start, but requires group allowed by admin
-async def batdau_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type == "private":
-        await update.message.reply_text("Lệnh /batdau chỉ dùng trong nhóm.")
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        # check allowed
-        cur = await db.execute("SELECT allowed, running FROM groups WHERE chat_id = ?", (chat.id,))
-        row = await cur.fetchone()
-        if not row or row[0] != 1:
-            # notify admins that this group wants permission
-            for adm in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(adm, f"Yêu cầu cấp phép cho nhóm {chat.title or chat.id} ({chat.id}). Để cho phép, trả lời lệnh /allowgroup {chat.id} trong riêng tư với bot.")
-                except Exception:
-                    pass
-            await update.message.reply_text("Nhóm chưa được cấp phép. Mình đã gửi yêu cầu cho admin để cấp quyền.")
-            # ensure group record exists
-            await db.execute("INSERT OR IGNORE INTO groups (chat_id, allowed, running) VALUES (?, ?, ?)", (chat.id, 0, 0))
-            await db.commit()
-            return
-        # if allowed, start runner if not already running
-        if row[1] == 1:
-            await update.message.reply_text("Phiên đã đang chạy trong nhóm.")
-            return
-        # set running = 1
-        await db.execute("UPDATE groups SET running = 1, last_started = ? WHERE chat_id = ?", (datetime.utcnow().isoformat(), chat.id))
-        await db.commit()
-    # spawn runner task
-    app = context.application
-    if chat.id in chat_tasks:
-        await update.message.reply_text("Runner đã chạy.")
-        return
-    t = app.create_task(chat_runner(app, chat.id))
-    chat_tasks[chat.id] = t
-    await update.message.reply_text(f"Đã bật chế độ chơi tự động - mỗi {ROUND_INTERVAL}s sẽ có 1 phiên.")
-
-# Admin commands (private chat)
-@admin_only
-async def allowgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # usage: /allowgroup <chat_id>
+    ensure_user(user.id, user.username or "", user.first_name or "")
     args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /allowgroup <chat_id>")
-        return
-    try:
-        cid = int(args[0])
-    except:
-        await update.message.reply_text("chat_id phải là số nguyên.")
-        return
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT OR REPLACE INTO groups (chat_id, allowed, running) VALUES (?, ?, ?)", (cid, 1, 0))
-        await db.commit()
-    await update.message.reply_text(f"Đã cấp phép cho nhóm {cid}.")
-
-@admin_only
-async def denygroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /denygroup <chat_id>")
-        return
-    cid = int(args[0])
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE groups SET allowed = 0, running = 0 WHERE chat_id = ?", (cid,))
-        await db.commit()
-    # cancel runner if any
-    if cid in chat_tasks:
-        chat_tasks[cid].cancel()
-    await update.message.reply_text(f"Đã thu hồi phép nhóm {cid}.")
-
-@admin_only
-async def stopgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /stopgroup <chat_id>")
-        return
-    cid = int(args[0])
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE groups SET running = 0 WHERE chat_id = ?", (cid,))
-        await db.commit()
-    if cid in chat_tasks:
-        chat_tasks[cid].cancel()
-    await update.message.reply_text(f"Đã tắt chạy tự động nhóm {cid}.")
-
-@admin_only
-async def kqtai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Force next resolution in last session for a group to T
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /KqTai <chat_id>")
-        return
-    cid = int(args[0])
-    # set one-time forced mode
-    chat_forced_mode[cid] = 'T'
-    await update.message.reply_text(f"Đã set kết quả tiếp theo cho nhóm {cid} là Tài (lệnh im lặng, không báo trong nhóm).")
-
-@admin_only
-async def kqxiu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /KqXiu <chat_id>")
-        return
-    cid = int(args[0])
-    chat_forced_mode[cid] = 'X'
-    await update.message.reply_text(f"Đã set kết quả tiếp theo cho nhóm {cid} là Xỉu (lệnh im lặng).")
-
-@admin_only
-async def bettai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /bettai <chat_id> => turn on repeated T
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /bettai <chat_id>")
-        return
-    cid = int(args[0])
-    chat_bet_mode[cid] = 'T'
-    await update.message.reply_text(f"Bật chế độ bệt Tài cho nhóm {cid} (im lặng ở nhóm).")
-
-@admin_only
-async def betxiu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /betxiu <chat_id>")
-        return
-    cid = int(args[0])
-    chat_bet_mode[cid] = 'X'
-    await update.message.reply_text(f"Bật chế độ bệt Xỉu cho nhóm {cid} (im lặng ở nhóm).")
-
-@admin_only
-async def tatbet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("Cú pháp: /tatbet <chat_id>")
-        return
-    cid = int(args[0])
-    chat_bet_mode[cid] = None
-    await update.message.reply_text(f"Tắt chế độ bệt cho nhóm {cid} — trở về random.")
-
-@admin_only
-async def addmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /addmoney <tg_id> <amount>
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Cú pháp: /addmoney <tg_id> <amount>")
-        return
-    uid = int(args[0])
-    amt = float(args[1])
-    async with aiosqlite.connect(DB_FILE) as db:
-        new = await change_balance(db, uid, amt)
-    await update.message.reply_text(f"Đã cộng {amt:.2f} cho {uid}. Số dư mới: {new:.2f}")
-
-@admin_only
-async def top10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # top 10 users by streak_win
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT tg_id, username, streak_win FROM users ORDER BY streak_win DESC LIMIT 10")
-        rows = await cur.fetchall()
-    txt = "Top 10 chuỗi thắng:\n"
-    for r in rows:
-        txt += f"{r[0]} @{r[1] or 'no'} - Chuỗi: {r[2]}\n"
-    await update.message.reply_text(txt)
-
-# Withdraw command by user: /ruttien <bank> <account> <amount>
-async def ruttien_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    user = update.effective_user
     if len(args) < 3:
-        await update.message.reply_text("Cú pháp: /ruttien <Ngân hàng> <Số tài khoản> <Số tiền>")
+        await update.message.reply_text("Sai cú pháp. Ví dụ: /ruttien Vietcombank 0123456789 100000")
         return
     bank = args[0]
-    acc = args[1]
+    account = args[1]
     try:
-        amt = float(args[2])
+        amount = int(args[2])
     except:
         await update.message.reply_text("Số tiền không hợp lệ.")
         return
-    if amt < 100000:
+    if amount < 100000:
         await update.message.reply_text("Rút tối thiểu 100000 vnđ.")
         return
-    async with aiosqlite.connect(DB_FILE) as db:
-        # check 0.9 vòng cược: approximate by total_bets >= 0.9 * (???)
-        # We'll interpret: user must have placed bets totaling >= 0.9 * requested amount
-        cur = await db.execute("SELECT total_bets, balance FROM users WHERE tg_id = ?", (user.id,))
-        r = await cur.fetchone()
-        total_bets = float(r[0]) if r else 0.0
-        bal = float(r[1]) if r else 0.0
-        if total_bets < 0.9 * amt:
-            await update.message.reply_text("Bạn chưa cược đủ 0.9 vòng (tổng cược chưa đạt yêu cầu).")
-            return
-        if bal < amt:
-            await update.message.reply_text("Số dư không đủ để rút.")
-            return
-        # create withdraw request
-        await db.execute("INSERT INTO withdraws (user_id, bank_name, account_number, amount, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-                         (user.id, bank, acc, amt, datetime.utcnow().isoformat()))
-        # deduct temporarily to avoid double requests
-        await change_balance(db, user.id, -amt)
-        await db.commit()
-        # notify admins with inline buttons to approve/deny
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Thành công", callback_data=f"wd_ok:{user.id}:{amt}"),
-             InlineKeyboardButton("Từ chối", callback_data=f"wd_reject:{user.id}:{amt}")]
-        ])
-        for adm in ADMIN_IDS:
-            try:
-                await context.bot.send_message(adm, f"Yêu cầu rút tiền từ {user.id} - {user.full_name} - {bank} - {acc} - {amt:.2f}", reply_markup=kb)
-            except:
-                pass
-        await update.message.reply_text("Vui lòng chờ, nếu sau 1 tiếng chưa thấy thông báo Thành công/Từ chối thì nhắn admin nhé!")
-
-# Callback handler for withdraw admin buttons
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    parts = data.split(":")
-    if len(parts) < 3:
+    # check betting requirement
+    u = get_user(user.id)
+    if not u:
+        await update.message.reply_text("Không tìm thấy tài khoản.")
         return
-    cmd, uid_s, amt_s = parts[0], parts[1], parts[2]
-    uid = int(uid_s)
-    amt = float(amt_s)
-    # Only admin can press; we check sender
-    if q.from_user.id not in ADMIN_IDS:
-        await q.edit_message_text("Bạn không có quyền xử lý yêu cầu này.")
+    total_deposited = u["total_deposited"] or 0.0
+    total_bet_volume = u["total_bet_volume"] or 0.0
+    required = 0.9 * total_deposited
+    if total_deposited > 0 and total_bet_volume < required:
+        await update.message.reply_text(f"Bạn chưa cược đủ. Cần cược tối thiểu {required:,.0f} (đã cược {total_bet_volume:,.0f}).")
         return
-    async with aiosqlite.connect(DB_FILE) as db:
-        if cmd == "wd_ok":
-            # mark withdraw as success
-            await db.execute("UPDATE withdraws SET status = 'done' WHERE user_id = ? AND amount = ? AND status = 'pending'", (uid, amt))
-            await db.commit()
-            # notify user
-            try:
-                await context.bot.send_message(uid, f"Yêu cầu rút tiền {amt:.2f} đã được duyệt. Vui lòng kiểm tra tài khoản ngân hàng.")
-            except:
-                pass
-            await q.edit_message_text("Đã thực hiện: Thành công.")
-        elif cmd == "wd_reject":
-            # mark reject and refund
-            await db.execute("UPDATE withdraws SET status = 'rejected' WHERE user_id = ? AND amount = ? AND status = 'pending'", (uid, amt))
-            # refund balance
-            await change_balance(db, uid, amt)
-            await db.commit()
-            try:
-                await context.bot.send_message(uid, f"Yêu cầu rút tiền {amt:.2f} đã bị từ chối. Tiền đã được hoàn về tài khoản của bạn.")
-            except:
-                pass
-            await q.edit_message_text("Đã thực hiện: Từ chối và hoàn tiền.")
+    if amount > u["balance"]:
+        await update.message.reply_text("Số dư không đủ.")
+        return
 
-# Basic commands
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    async with aiosqlite.connect(DB_FILE) as db:
-        bal = await get_balance(db, user.id)
-    await update.message.reply_text(f"Số dư hiện tại: {bal:.2f}")
-
-# Admin: list crash /set up exception handler (we'll notify in main exception)
-@admin_only
-async def crash_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raise RuntimeError("Crash test by admin")
-
-# echo / help
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("/menu - Menu\n/start - bắt đầu\n/balance - Xem số dư\n/ruttien - rút tiền\n")
-    else:
-        await update.message.reply_text("/batdau - bật phiên tự động (yêu cầu nhóm được cấp phép)\n/T<amount> hoặc /X<amount> để cược.")
-
-# -------------------------
-# Startup and shutdown
-# -------------------------
-async def on_startup(app: Application):
-    await init_db()
-    # Restart tasks for groups that were running before possible crash
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute("SELECT chat_id FROM groups WHERE allowed = 1 AND running = 1")
-        rows = await cur.fetchall()
-    for r in rows:
-        cid = r[0]
-        if cid not in chat_tasks:
-            t = app.create_task(chat_runner(app, cid))
-            chat_tasks[cid] = t
-    logger.info("Bot started. Active runners: %s", list(chat_tasks.keys()))
-
-async def on_shutdown(app: Application):
-    # cancel tasks
-    for t in list(chat_tasks.values()):
-        t.cancel()
-    logger.info("Shutting down...")
-
-# Global error handler to notify admin
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Exception in update handler: %s", context.error)
-    # Notify admins
-    for adm in ADMIN_IDS:
+    # Send request to admin with approve/deny inline buttons
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Thành công", callback_data=f"withdraw_ok|{user.id}|{amount}|{bank}|{account}"),
+         InlineKeyboardButton("Từ chối", callback_data=f"withdraw_no|{user.id}|{amount}|{bank}|{account}")]
+    ])
+    # Inform user
+    await update.message.reply_text("Vui lòng chờ, nếu sau 1 tiếng chưa thấy thông báo Thành công/Từ chối thì nhắn admin nhé!")
+    # Notify all admins
+    text = f"YÊU CẦU RÚT TIỀN\nUser: @{user.username or user.first_name} (id: {user.id})\nBank: {bank}\nAccount: {account}\nAmount: {amount:,}₫"
+    for aid in ADMIN_IDS:
         try:
-            await context.bot.send_message(adm, f"Bot gặp lỗi: {context.error}")
+            await context.bot.send_message(chat_id=aid, text=text, reply_markup=kb)
+        except Exception:
+            logger.exception(f"Cannot notify admin {aid} for withdraw request")
+
+async def withdraw_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    # pattern: withdraw_ok|user_id|amount|bank|account  OR withdraw_no|...
+    parts = data.split("|")
+    action = parts[0]
+    try:
+        user_id = int(parts[1])
+        amount = int(parts[2])
+        bank = parts[3]
+        account = parts[4]
+    except Exception:
+        await query.edit_message_text("Dữ liệu không hợp lệ.")
+        return
+
+    # Only admins can press these
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("Chỉ admin mới thao tác.")
+        return
+
+    if action == "withdraw_ok":
+        # Deduct amount and notify user
+        u = get_user(user_id)
+        if not u:
+            await query.edit_message_text("User không tồn tại.")
+            return
+        if u["balance"] < amount:
+            await query.edit_message_text("User không đủ tiền.")
+            try:
+                await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ bị từ chối: số dư không đủ.")
+            except:
+                pass
+            return
+        new_bal = u["balance"] - amount
+        db_execute("UPDATE users SET balance=? WHERE user_id=?", (new_bal, user_id))
+        await query.edit_message_text(f"Đã xác nhận rút {amount:,}₫ cho user {user_id}.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ đã được duyệt bởi admin. Vui lòng chờ chuyển khoản.")
+        except:
+            pass
+    else:
+        await query.edit_message_text(f"Yêu cầu rút {amount:,}₫ đã bị từ chối bởi admin {query.from_user.id}.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ đã bị từ chối bởi admin. Vui lòng liên hệ.")
         except:
             pass
 
-# -------------------------
-# Main
-# -------------------------
+# Betting message in groups or private: /T1000 or /X500
+async def bet_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    text = msg.text.strip()
+    user = update.effective_user
+    chat = update.effective_chat
+    # accept patterns like /T1000 or /t1000 or /X500
+    if not text.startswith("/"):
+        return
+    cmd = text[1:]
+    if len(cmd) < 2:
+        return
+    prefix = cmd[0].lower()
+    if prefix not in ('t', 'x'):
+        return
+    side = 'tai' if prefix == 't' else 'xiu'
+    # parse amount
+    try:
+        amount = int(cmd[1:])
+    except:
+        await msg.reply_text("Cú pháp đặt cược sai. Ví dụ: /T1000 hoặc /X5000")
+        return
+    if amount < MIN_BET:
+        await msg.reply_text(f"Đặt cược tối thiểu {MIN_BET:,}₫")
+        return
+
+    # If in group, check group approved and running
+    if chat.type in ("group", "supergroup"):
+        g = db_query("SELECT approved, running FROM groups WHERE chat_id=?", (chat.id,))
+        if not g or g[0]["approved"] != 1 or g[0]["running"] != 1:
+            await msg.reply_text("Nhóm này chưa được admin duyệt hoặc chưa bật /batdau.")
+            return
+
+    # ensure user and check balance
+    ensure_user(user.id, user.username or "", user.first_name or "")
+    u = get_user(user.id)
+    if u["balance"] < amount:
+        await msg.reply_text("Số dư không đủ.")
+        return
+
+    # Deduct immediately, store bet
+    new_balance = u["balance"] - amount
+    new_total_bet = (u["total_bet_volume"] or 0.0) + amount
+    db_execute("UPDATE users SET balance=?, total_bet_volume=? WHERE user_id=?", (new_balance, new_total_bet, user.id))
+
+    # round_id strategy: use integer floor of timestamp / ROUND_SECONDS as epoch round
+    now_ts = int(datetime.utcnow().timestamp())
+    round_epoch = now_ts // ROUND_SECONDS
+    round_id = f"{chat.id}_{round_epoch}"
+    db_execute("INSERT INTO bets(chat_id, round_id, user_id, side, amount, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+               (chat.id, round_id, user.id, side, amount, now_iso()))
+
+    await msg.reply_text(f"Đã đặt {side.upper()} {amount:,}₫ cho phiên hiện tại.")
+
+# Admin /addmoney
+async def addmoney_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Chỉ admin mới dùng lệnh này.")
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Cú pháp: /addmoney <user_id> <amount>")
+        return
+    try:
+        uid = int(args[0])
+        amt = float(args[1])
+    except:
+        await update.message.reply_text("Tham số không hợp lệ.")
+        return
+    ensure_user(uid, "", "")
+    u = get_user(uid)
+    new_bal = (u["balance"] or 0.0) + amt
+    new_deposited = (u["total_deposited"] or 0.0) + amt
+    db_execute("UPDATE users SET balance=?, total_deposited=? WHERE user_id=?", (new_bal, new_deposited, uid))
+    await update.message.reply_text(f"Đã cộng {amt:,.0f}₫ cho user {uid}.")
+
+# Admin top10 by best streak
+async def top10_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Chỉ admin.")
+        return
+    rows = db_query("SELECT user_id, best_streak FROM users ORDER BY best_streak DESC LIMIT 10")
+    text = "Top 10 người có chuỗi thắng dài nhất:\n"
+    for i, r in enumerate(rows, start=1):
+        text += f"{i}. {r['user_id']} — {r['best_streak']} thắng liên tiếp\n"
+    await update.message.reply_text(text)
+
+# Admin balance dump (debug)
+async def balances_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Chỉ admin.")
+        return
+    rows = db_query("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 50")
+    text = "Top balances:\n"
+    for r in rows:
+        text += f"- {r['user_id']}: {r['balance']:,.0f}\n"
+    await update.message.reply_text(text)
+
+# Admin commands to set result or bet mode:
+# /KqTai <chat_id>  => one-shot force to tai (the DB stores 'force_tai' and reverts after one round)
+# /KqXiu <chat_id>
+# /bettai <chat_id> => continuous bet bệt (always result TAI)
+# /betxiu <chat_id>
+# /tatbet <chat_id> => revert to random
+async def admin_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Chỉ admin.")
+        return
+    text = update.message.text.strip()
+    cmd = text.split()[0].lower()
+    args = context.args
+    if not args:
+        await update.message.reply_text("Cú pháp: /KqTai <chat_id> hoặc /bettai <chat_id> ...")
+        return
+    try:
+        chat_id = int(args[0])
+    except:
+        await update.message.reply_text("chat_id không hợp lệ.")
+        return
+
+    if cmd == "/kqtai":
+        db_execute("UPDATE groups SET bet_mode=? WHERE chat_id=?", ("force_tai", chat_id))
+        await update.message.reply_text(f"Đã đặt force TÀI cho nhóm {chat_id}. (Không thông báo vào nhóm)")
+    elif cmd == "/kqxiu":
+        db_execute("UPDATE groups SET bet_mode=? WHERE chat_id=?", ("force_xiu", chat_id))
+        await update.message.reply_text(f"Đã đặt force XỈU cho nhóm {chat_id}. (Không thông báo vào nhóm)")
+    elif cmd == "/bettai":
+        db_execute("UPDATE groups SET bet_mode=? WHERE chat_id=?", ("bettai", chat_id))
+        await update.message.reply_text(f"Đã bật cầu bệt TÀI cho nhóm {chat_id}. (Không thông báo vào nhóm)")
+    elif cmd == "/betxiu":
+        db_execute("UPDATE groups SET bet_mode=? WHERE chat_id=?", ("betxiu", chat_id))
+        await update.message.reply_text(f"Đã bật cầu bệt XỈU cho nhóm {chat_id}. (Không thông báo vào nhóm)")
+    elif cmd == "/tatbet":
+        db_execute("UPDATE groups SET bet_mode=? WHERE chat_id=?", ("random", chat_id))
+        await update.message.reply_text(f"Đã tắt cầu bệt và trả về random cho nhóm {chat_id}.")
+    else:
+        await update.message.reply_text("Lệnh admin không hợp lệ.")
+
+# Group command /batdau: request admin approve, after approve group can run rounds.
+async def batdau_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("/batdau chỉ dùng trong nhóm.")
+        return
+    title = chat.title or ""
+    # ensure group stored
+    rows = db_query("SELECT chat_id FROM groups WHERE chat_id=?", (chat.id,))
+    if not rows:
+        db_execute("INSERT INTO groups(chat_id, title, approved, running, bet_mode, last_round) VALUES (?, ?, 0, 0, 'random', ?)",
+                   (chat.id, title, 0))
+    # send approval request to admins
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Duyệt", callback_data=f"approve|{chat.id}"),
+         InlineKeyboardButton("Từ chối", callback_data=f"deny|{chat.id}")]
+    ])
+    text = f"Yêu cầu bật bot cho nhóm:\n{title}\nchat_id: {chat.id}\nNgười yêu cầu: {update.effective_user.id}"
+    # send to each admin
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=aid, text=text, reply_markup=kb)
+        except Exception:
+            logger.exception(f"Không gửi được yêu cầu duyệt nhóm tới admin {aid}")
+    await update.message.reply_text("Đã gửi yêu cầu tới admin để duyệt.")
+
+# Callback for approve/deny
+async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    parts = data.split("|")
+    if len(parts) != 2:
+        await query.edit_message_text("Dữ liệu không hợp lệ.")
+        return
+    action, chat_id_s = parts
+    try:
+        chat_id = int(chat_id_s)
+    except:
+        await query.edit_message_text("chat_id không hợp lệ.")
+        return
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("Chỉ admin mới thao tác.")
+        return
+    if action == "approve":
+        db_execute("UPDATE groups SET approved=1, running=1 WHERE chat_id=?", (chat_id,))
+        await query.edit_message_text(f"Đã duyệt và bật chạy cho nhóm {chat_id}.")
+        # notify group
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="Bot đã được admin duyệt — bắt đầu chạy phiên mỗi 60s. Gõ /batdau để khởi động lại nếu cần.")
+        except Exception:
+            pass
+    else:
+        db_execute("UPDATE groups SET approved=0, running=0 WHERE chat_id=?", (chat_id,))
+        await query.edit_message_text(f"Đã từ chối cho nhóm {chat_id}.")
+
+# Helper: get groups that are approved and running
+def get_active_groups() -> List[Dict[str, Any]]:
+    rows = db_query("SELECT chat_id, bet_mode, last_round FROM groups WHERE approved=1 AND running=1")
+    return [dict(r) for r in rows]
+
+# -----------------------
+# ROUND ENGINE
+# -----------------------
+
+# rounds_loop: background coroutine that launches run_round_for_group for each active group every ROUND_SECONDS
+async def rounds_loop(app: Application):
+    logger.info("Rounds loop starting...")
+    # minimal initial delay to let bot boot
+    await asyncio.sleep(2)
+    while True:
+        try:
+            groups = get_active_groups()
+            if groups:
+                logger.debug(f"Active groups: {[g['chat_id'] for g in groups]}")
+            tasks = []
+            for g in groups:
+                chat_id = g['chat_id']
+                # Launch a task to run this group's current round.
+                tasks.append(asyncio.create_task(run_round_for_group(app, chat_id)))
+            # wait for all group tasks to finish (they should be quick) or time out
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            # Notify admins about the exception
+            logger.exception("Exception in rounds_loop")
+            for aid in ADMIN_IDS:
+                try:
+                    await app.bot.send_message(chat_id=aid, text=f"ERROR - rounds_loop exception:\n{e}")
+                except Exception:
+                    pass
+        # Sleep until next tick; note that run_round_for_group uses round_id calculation by epoch of ROUND_SECONDS
+        await asyncio.sleep(ROUND_SECONDS)
+
+# run_round_for_group: does a single round's processing for the given group
+async def run_round_for_group(app: Application, chat_id: int):
+    """
+    1) Determine current round_id (based on epoch)
+    2) Read bets for this round
+    3) Decide result (consider group.bet_mode for forced or bet bệt)
+    4) Compute winners/losers, update balances & pot accordingly
+    5) Handle special triple 1/6 -> distribute pot proportionally to winners
+    6) Save history and send messages to group & admin
+    """
+    try:
+        now_ts = int(datetime.utcnow().timestamp())
+        round_epoch = now_ts // ROUND_SECONDS
+        round_index = round_epoch  # used as incremental epoch
+        round_id = f"{chat_id}_{round_epoch}"
+
+        # gather bets
+        bets_rows = db_query("SELECT user_id, side, amount FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+        bets = [dict(r) for r in bets_rows]
+
+        # Get group's bet_mode to determine forced/bettai/betxiu/random
+        grows = db_query("SELECT bet_mode FROM groups WHERE chat_id=?", (chat_id,))
+        bet_mode = grows[0]["bet_mode"] if grows else "random"
+
+        # Decide result (apply forced once semantics, bet bệt semantics)
+        # If bet_mode == force_tai or force_xiu: apply and revert to random
+        forced_applied = False
+        forced_value = None
+        if bet_mode == "force_tai":
+            forced_value = "tai"
+            forced_applied = True
+            # revert to random after applying
+            db_execute("UPDATE groups SET bet_mode='random' WHERE chat_id=?", (chat_id,))
+        elif bet_mode == "force_xiu":
+            forced_value = "xiu"
+            forced_applied = True
+            db_execute("UPDATE groups SET bet_mode='random' WHERE chat_id=?", (chat_id,))
+        elif bet_mode == "bettai":
+            forced_value = "tai"
+        elif bet_mode == "betxiu":
+            forced_value = "xiu"
+        # If forced_value is None, roll normally
+        if forced_value:
+            # to add unpredictability while honoring admin, we still generate dice that match the forced outcome
+            # find a random dice triple that leads to desired result, but keep some randomness
+            # Simpler: attempt until we get a dice total in target range
+            attempts = 0
+            dice, total, special = roll_three_dice()
+            while result_from_total(total) != forced_value and attempts < 50:
+                dice, total, special = roll_three_dice()
+                attempts += 1
+            result = result_from_total(total)
+        else:
+            dice, total, special = roll_three_dice()
+            result = result_from_total(total)
+
+        # Persist history
+        dice_str = ",".join(map(str, dice))
+        db_execute("INSERT INTO history(chat_id, round_index, round_id, result, dice, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                   (chat_id, round_index, round_id, result, dice_str, now_iso()))
+
+        # Compute winners & losers
+        winners = []
+        losers = []
+        total_winner_bets = 0.0
+        total_loser_bets = 0.0
+
+        for b in bets:
+            if b["side"] == result:
+                winners.append((b["user_id"], b["amount"]))
+                total_winner_bets += b["amount"]
+            else:
+                losers.append((b["user_id"], b["amount"]))
+                total_loser_bets += b["amount"]
+
+        # Losers' amounts go to pot
+        if total_loser_bets > 0:
+            add_to_pot(total_loser_bets)
+
+        # For each winner: credit payout = amount * WIN_MULTIPLIER; house share = amount * HOUSE_RATE -> add to pot
+        winners_paid = []
+        for uid, amt in winners:
+            # house share to pot
+            house_share = amt * HOUSE_RATE
+            add_to_pot(house_share)
+            payout = amt * WIN_MULTIPLIER
+            ensure_user(uid, "", "")
+            u = get_user(uid)
+            new_balance = (u["balance"] or 0.0) + payout
+            # update streaks
+            cur_streak = (u["current_streak"] or 0) + 1
+            best_streak = max(u["best_streak"] or 0, cur_streak)
+            db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, cur_streak, best_streak, uid))
+            winners_paid.append((uid, payout, amt))
+
+        # For losers: reset streak to 0
+        for uid, amt in losers:
+            rows = db_query("SELECT current_streak FROM users WHERE user_id=?", (uid,))
+            if rows:
+                db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+
+        # Special triple handling: 3x1 or 3x6 -> distribute entire pot proportionally to winners in this round
+        special_msg = ""
+        if special in ("triple1", "triple6"):
+            pot_amount = get_pot_amount()
+            if pot_amount > 0 and winners:
+                total_bets_win = sum([amt for (_, amt) in winners])
+                if total_bets_win > 0:
+                    distributed = []
+                    for uid, amt in winners:
+                        share = (amt / total_bets_win) * pot_amount
+                        ensure_user(uid, "", "")
+                        u = get_user(uid)
+                        db_execute("UPDATE users SET balance=? WHERE user_id=?", ((u["balance"] or 0.0) + share, uid))
+                        distributed.append((uid, share))
+                    special_msg = f"Hũ {pot_amount:,.0f}₫ đã được chia cho người thắng theo tỷ lệ cược!"
+                    reset_pot()
+            else:
+                # if no winners, keep pot as is
+                pass
+
+        # Remove bets from DB for this round
+        db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+
+        # Prepare and send group message: show result and short history
+        display = "ĐEN (Tài)" if result == "tai" else "TRẮNG (Xỉu)"
+        msg = f"▶️ Phiên {round_index} — Kết quả: {display}\n"
+        msg += f"Xúc xắc: {dice_str} — Tổng: {total}\n"
+        if special_msg:
+            msg += f"\n{special_msg}\n"
+        # provide short history (last 10)
+        hist_rows = db_query("SELECT result, dice, timestamp FROM history WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat_id,))
+        if hist_rows:
+            msg += "\nLịch sử (gần nhất):\n"
+            for hr in hist_rows:
+                r = hr["result"]
+                d = hr["dice"]
+                rdisp = "ĐEN" if r == "tai" else "TRẮNG"
+                msg += f"- {rdisp} | {d}\n"
+
+        # Send message to group (do not reveal admin forced actions — we only post final)
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception:
+            logger.exception("Cannot send round result to group")
+
+        # Also send short summary to admins (optional)
+        if winners_paid:
+            admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
+            for uid, payout, amt in winners_paid:
+                admin_summary += f"- {uid}: đặt {amt:,.0f} -> nhận {payout:,.0f}\n"
+            try:
+                for aid in ADMIN_IDS:
+                    await app.bot.send_message(chat_id=aid, text=admin_summary)
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception("Exception in run_round_for_group")
+        # notify admins
+        for aid in ADMIN_IDS:
+            try:
+                await app.bot.send_message(chat_id=aid, text=f"ERROR - run_round_for_group exception for group {chat_id}: {e}\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+# -----------------------
+# STARTUP / SHUTDOWN HANDLERS
+# -----------------------
+
+async def on_startup(app: Application):
+    logger.info("Bot starting up...")
+    # ensure DB
+    init_db()
+    # Schedule rounds loop
+    app.create_task(rounds_loop(app))
+    # Inform admins that bot started
+    for aid in ADMIN_IDS:
+        try:
+            await app.bot.send_message(chat_id=aid, text="Bot đã khởi động và sẵn sàng.")
+        except Exception:
+            pass
+
+async def on_shutdown(app: Application):
+    logger.info("Bot shutting down...")
+    # Inform admins on shutdown
+    for aid in ADMIN_IDS:
+        try:
+            await app.bot.send_message(chat_id=aid, text="Bot đang tắt (shutdown).")
+        except Exception:
+            pass
+
+# Exception handler for loop-level exceptions
+def handle_loop_exception(loop, context):
+    msg = context.get("exception", context.get("message"))
+    logger.error(f"Caught exception in event loop: {msg}")
+    # Asynchronously notify admins via background task if app exists
+    # We cannot call bot methods here because we don't have app context; but we will rely on try/except in other places.
+
+# -----------------------
+# MAIN: Build Application & Handlers
+# -----------------------
+
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
+        print("ERROR: BOT_TOKEN not set. Please edit bot.py and set BOT_TOKEN to your bot token or set BOT_TOKEN env variable.")
+        # we do not exit forcibly because the user may want to set env; but running without token will fail auth.
+    # init db early
+    init_db()
 
-    # user commands
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("menu", menu_cmd))
-    application.add_handler(CallbackQueryHandler(menu_button_cb, pattern="menu_"))
-    application.add_handler(CommandHandler("balance", balance_cmd))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("batdau", batdau_cmd))
-    application.add_handler(CommandHandler("ruttien", ruttien_cmd))
+    # Build application
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # betting: treat messages starting with /T or /X followed by number
-    application.add_handler(MessageHandler(filters.Regex(r"^/[Tt]\d+$") | filters.Regex(r"^/[Xx]\d+$"), bet_handler))
+    # Register handlers - commands
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("game", game_info))
+    app.add_handler(CommandHandler("nap", nap_info))
+    app.add_handler(CommandHandler("ruttien", ruttien_handler))
+    app.add_handler(CallbackQueryHandler(withdraw_callback_handler, pattern=r"^withdraw_.*|^withdraw.*"))  # general
 
-    # admin commands (private only)
-    application.add_handler(CommandHandler("allowgroup", allowgroup_cmd))
-    application.add_handler(CommandHandler("denygroup", denygroup_cmd))
-    application.add_handler(CommandHandler("stopgroup", stopgroup_cmd))
-    application.add_handler(CommandHandler("KqTai", kqtai_cmd))
-    application.add_handler(CommandHandler("KqXiu", kqxiu_cmd))
-    application.add_handler(CommandHandler("bettai", bettai_cmd))
-    application.add_handler(CommandHandler("betxiu", betxiu_cmd))
-    application.add_handler(CommandHandler("tatbet", tatbet_cmd))
-    application.add_handler(CommandHandler("addmoney", addmoney_cmd))
-    application.add_handler(CommandHandler("top10", top10_cmd))
-    application.add_handler(CommandHandler("crashtest", crash_test))
+    # Admin commands
+    app.add_handler(CommandHandler("addmoney", addmoney_handler))
+    app.add_handler(CommandHandler("top10", top10_handler))
+    app.add_handler(CommandHandler("balances", balances_handler))
+    app.add_handler(CommandHandler("KqTai", admin_force_handler))
+    app.add_handler(CommandHandler("KqXiu", admin_force_handler))
+    app.add_handler(CommandHandler("bettai", admin_force_handler))
+    app.add_handler(CommandHandler("betxiu", admin_force_handler))
+    app.add_handler(CommandHandler("tatbet", admin_force_handler))
 
-    # callback handler for withdraw approval
-    application.add_handler(CallbackQueryHandler(callback_query_handler, pattern="^wd_"))
+    # Group control
+    app.add_handler(CommandHandler("batdau", batdau_handler))
+    app.add_handler(CallbackQueryHandler(approve_callback_handler, pattern=r"^(approve|deny)\|"))
 
-    application.add_error_handler(error_handler)
+    # Betting messages (pattern /T123 /X500)
+    app.add_handler(MessageHandler(filters.Regex(r"^/[TtXx]\d+"), bet_message_handler))
 
-    application.post_init = on_startup
-    application.stop = on_shutdown
+    # Menu text in private
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
-    # run
-    logger.info("Starting application...")
-    application.run_polling(stop_signals=None)  # Render will keep process alive
+    # startup/shutdown
+    app.post_init = None
+    app.add_handler(CommandHandler("start", start_handler))  # redundant safe
+    app.add_handler(CommandHandler("game", game_info))
+
+    # set event handlers
+    app._init_once = False
+    app.run_async = True
+
+    # Hook startup and shutdown
+    app.add_handler(CommandHandler("help", start_handler))
+
+    # Set exception handler for event loop
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_loop_exception)
+
+    # Attach lifecycle callbacks
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    # Run app
+    try:
+        logger.info("Running bot with polling...")
+        app.run_polling(poll_interval=1.0)
+    except Exception as e:
+        logger.exception(f"Fatal error running the bot: {e}")
+        # Notify admins if possible (attempt)
+        for aid in ADMIN_IDS:
+            try:
+                # Don't await here; using high-level send may not work if app not started. Try ad-hoc minimal HTTP? skip.
+                pass
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # notify admins if crash on startup
-        logger.exception("Bot crashed at startup: %s", e)
-        for adm in ADMIN_IDS:
-            # best-effort: we cannot use bot API before Application built, but we can log
-            logger.info("Would notify admin %s about crash: %s", adm, e)
-        raise
+    main()
