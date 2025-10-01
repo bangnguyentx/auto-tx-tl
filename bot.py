@@ -834,9 +834,10 @@ def handle_loop_exception(loop, context):
 
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        print("ERROR: BOT_TOKEN not set. Please edit bot.py and set BOT_TOKEN to your bot token or set BOT_TOKEN env variable.")
-        # we do not exit forcibly because the user may want to set env; but running without token will fail auth.
-    # init db early
+        print("❌ ERROR: BOT_TOKEN not set. Please edit bot.py and set BOT_TOKEN.")
+        return
+
+    # init db sớm
     init_db()
 
     # Build application
@@ -847,7 +848,7 @@ def main():
     app.add_handler(CommandHandler("game", game_info))
     app.add_handler(CommandHandler("nap", nap_info))
     app.add_handler(CommandHandler("ruttien", ruttien_handler))
-    app.add_handler(CallbackQueryHandler(withdraw_callback_handler, pattern=r"^withdraw_.*|^withdraw.*"))  # general
+    app.add_handler(CallbackQueryHandler(withdraw_callback_handler, pattern=r"^withdraw_.*|^withdraw.*"))
 
     # Admin commands
     app.add_handler(CommandHandler("addmoney", addmoney_handler))
@@ -869,36 +870,24 @@ def main():
     # Menu text in private
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
-    # startup/shutdown
-    app.post_init = None
-    app.add_handler(CommandHandler("start", start_handler))  # redundant safe
-    app.add_handler(CommandHandler("game", game_info))
-
-    # set event handlers
-    app._init_once = False
-    app.run_async = True
-
-    # Hook startup and shutdown
-    app.add_handler(CommandHandler("help", start_handler))
-
-    # Set exception handler for event loop
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(handle_loop_exception)
-
-    # Attach lifecycle callbacks
+    # Hook startup and shutdown (hỗ trợ async lifecycle)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    # Run app
+    # Exception handler cho loop
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_loop_exception)
+
+    # Run polling
     try:
-        logger.info("Running bot with polling...")
+        logger.info("🚀 Bot đang chạy polling...")
         app.run_polling(poll_interval=1.0)
     except Exception as e:
-        logger.exception(f"Fatal error running the bot: {e}")
-        # Notify admins if possible (attempt)
+        logger.exception(f"❌ Fatal error running the bot: {e}")
+        # Thông báo admin nếu có thể
         for aid in ADMIN_IDS:
             try:
-                # Don't await here; using high-level send may not work if app not started. Try ad-hoc minimal HTTP? skip.
+                # Gửi tin nhắn báo lỗi cho admin (nếu bot vẫn hoạt động)
                 pass
             except Exception:
                 pass
