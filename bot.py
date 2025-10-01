@@ -896,13 +896,16 @@ def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Register handlers
+# -----------------------
+    # 📌 Đăng ký Command Handlers
+    # -----------------------
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("game", game_info))
     app.add_handler(CommandHandler("nap", nap_info))
     app.add_handler(CommandHandler("ruttien", ruttien_handler))
     app.add_handler(CallbackQueryHandler(withdraw_callback_handler, pattern=r"^withdraw_.*|^withdraw.*"))
 
+    # 🛠 Lệnh quản trị
     app.add_handler(CommandHandler("addmoney", addmoney_handler))
     app.add_handler(CommandHandler("top10", top10_handler))
     app.add_handler(CommandHandler("balances", balances_handler))
@@ -911,13 +914,19 @@ def main():
     app.add_handler(CommandHandler("bettai", admin_force_handler))
     app.add_handler(CommandHandler("betxiu", admin_force_handler))
     app.add_handler(CommandHandler("tatbet", admin_force_handler))
+
+    # 🧾 Lệnh tạo code & nhận code (ADMIN)
     app.add_handler(CommandHandler("code", admin_create_code_handler))
     app.add_handler(CommandHandler("nhancode", redeem_code_handler))
-    
+
+    # 🧠 Lệnh bắt đầu game trong nhóm (phải được admin duyệt trước)
     app.add_handler(CommandHandler("batdau", batdau_handler))
     app.add_handler(CallbackQueryHandler(approve_callback_handler, pattern=r"^(approve|deny)\|"))
 
+    # 🎲 Tin nhắn đặt cược /T1000 hoặc /X500
     app.add_handler(MessageHandler(filters.Regex(r"^/[TtXx]\d+"), bet_message_handler))
+
+    # 📝 Tin nhắn văn bản trong private (menu, hướng dẫn...)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
     # lifecycle hooks
