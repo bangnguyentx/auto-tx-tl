@@ -897,7 +897,6 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Register handlers
-    app.add_handler(CommandHandler("nhancode", redeem_code_handler))
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("game", game_info))
     app.add_handler(CommandHandler("nap", nap_info))
@@ -913,7 +912,8 @@ def main():
     app.add_handler(CommandHandler("betxiu", admin_force_handler))
     app.add_handler(CommandHandler("tatbet", admin_force_handler))
     app.add_handler(CommandHandler("code", admin_create_code_handler))
-
+    app.add_handler(CommandHandler("nhancode", redeem_code_handler))
+    
     app.add_handler(CommandHandler("batdau", batdau_handler))
     app.add_handler(CallbackQueryHandler(approve_callback_handler, pattern=r"^(approve|deny)\|"))
 
