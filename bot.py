@@ -874,7 +874,7 @@ def main():
 
     # Hook startup and shutdown (hỗ trợ async lifecycle)
     app.post_init = on_startup
-    app.on_shutdown.append(on_shutdown)
+    app.post_shutdown = on_shutdown
 
     # Exception handler cho loop
     loop = asyncio.get_event_loop()
