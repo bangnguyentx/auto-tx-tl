@@ -26,18 +26,21 @@ from telegram.ext import (
 )
 
 # -----------------------
-# KEEP A PORT OPEN (for Render if using Web Service)
-# -----------------------
-def keep_port_open():
-    PORT = int(os.environ.get("PORT_KEEP", 10000))
-    Handler = http.server.SimpleHTTPRequestHandler
-    try:
-        with socketserver.TCPServer(("", PORT), Handler) as httpd:
-            httpd.serve_forever()
-    except Exception:
-        # if fails, ignore (likely port in use)
-        pass
+# ==========================
+# Giữ cổng HTTP mở để Render không kill bot
+# ==========================
+import threading
+import http.server
+import socketserver
 
+def keep_port_open():
+    PORT = 10000   # trùng với PORT trong Render Environment
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", PORT), handler) as httpd:
+        print(f"🌐 HTTP server giữ cổng mở tại {PORT}")
+        httpd.serve_forever()
+
+# chạy song song, không chặn bot Telegram
 threading.Thread(target=keep_port_open, daemon=True).start()
 
 # -----------------------
