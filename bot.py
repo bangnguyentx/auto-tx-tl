@@ -855,6 +855,7 @@ def main():
 
     # Build application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     # Register handlers - commands
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("game", game_info))
@@ -882,29 +883,21 @@ def main():
     # Menu text in private
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
-    # Hook startup and shutdown (hỗ trợ async lifecycle)
-     app.post_init = on_startup
-     app.post_shutdown = on_shutdown
+    # ✅ Hook startup & shutdown đúng cú pháp
+    app.post_init = on_startup
+    app.post_shutdown = on_shutdown
 
-    # Exception handler cho loop
+    # ✅ Exception handler cho loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-         
     loop.set_exception_handler(handle_loop_exception)
 
-    # Run polling
+    # ✅ Run polling
     try:
         logger.info("🚀 Bot đang chạy polling...")
         app.run_polling(poll_interval=1.0)
     except Exception as e:
-        logger.exception(f"❌ Fatal error running the bot: {e}")
-        # Thông báo admin nếu có thể
-        for aid in ADMIN_IDS:
-            try:
-                # Gửi tin nhắn báo lỗi cho admin (nếu bot vẫn hoạt động)
-                pass
-            except Exception:
-                pass
+        logger.exception(f"Lỗi khi chạy bot: {e}")
 
 if __name__ == "__main__":
     main()
