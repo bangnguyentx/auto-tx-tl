@@ -412,30 +412,46 @@ async def bet_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     ensure_user(user.id, user.username or "", user.first_name or "")
     u = get_user(user.id)
 
-    # restricted check: if restricted_onek ==1 then amount must equal 1000 (or <=1000)
+    # restricted check: nếu đang ở chế độ thưởng thì chỉ cược tối đa 1000₫
     if u and u.get("restricted_onek", 0) == 1:
         if amount > 1000:
             await msg.reply_text("Bạn đang ở chế độ tặng thưởng (10k) và chỉ được cược tối đa 1.000₫. Liên hệ admin để mở giới hạn.")
             return
 
+    # kiểm tra số dư
     if (u["balance"] or 0.0) < amount:
         await msg.reply_text("Số dư không đủ.")
         return
 
-    # deduct immediately and update total_bet_volume
+    # trừ tiền và cộng tổng khối lượng cược
     new_balance = (u["balance"] or 0.0) - amount
     new_total_bet = (u["total_bet_volume"] or 0.0) + amount
-    db_execute("UPDATE users SET balance=?, total_bet_volume=? WHERE user_id=?", (new_balance, new_total_bet, user.id))
+    db_execute(
+        "UPDATE users SET balance=?, total_bet_volume=? WHERE user_id=?",
+        (new_balance, new_total_bet, user.id)
+    )
 
-    # round_id = chatid_epoch
+    # tạo round_id và lưu cược
     now_ts = int(datetime.utcnow().timestamp())
     round_epoch = now_ts // ROUND_SECONDS
     round_id = f"{chat.id}_{round_epoch}"
-    db_execute("INSERT INTO bets(chat_id, round_id, user_id, side, amount, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-               (chat.id, round_id, user.id, side, amount, now_iso()))
 
-    await msg.reply_text(f"Đã đặt {side.upper()} {amount:,}₫ cho phiên hiện tại. Số dư còn {int(new_balance):,}₫")
+    db_execute(
+        "INSERT INTO bets(chat_id, round_id, user_id, side, amount, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat.id, round_id, user.id, side, amount, now_iso())
+    )
 
+    # ✅ cập nhật tiến độ vòng cược code khuyến mãi
+    try:
+        await update_promo_wager_progress(context, user.id, round_id)
+    except Exception:
+        logger.exception("update_promo_wager_progress failed")
+
+    # gửi phản hồi cuối
+    await msg.reply_text(
+        f"Đã đặt {side.upper()} {amount:,}₫ cho phiên hiện tại. Số dư còn {int(new_balance):,}₫"
+            )
+    
 # -----------------------
 # ADMIN HANDLERS
 # -----------------------
@@ -520,6 +536,171 @@ async def admin_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text("Lệnh admin không hợp lệ.")
 
+# === Promo code admin + redeem + wager progress tracking ===
+# (Dán đoạn này trước khi main(), nơi bạn đăng ký handlers)
+
+import secrets  # thêm nếu chưa import ở đầu file
+
+# Ensure promo tables exist (safe to call multiple times)
+def ensure_promo_tables():
+    # promo_codes: single-use codes
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS promo_codes (
+        code TEXT PRIMARY KEY,
+        amount REAL,
+        wager_required INTEGER,
+        used INTEGER DEFAULT 0,
+        created_by INTEGER,
+        created_at TEXT
+    )
+    """)
+    # promo_redemptions: track per-user redemptions and progress
+    db_execute("""
+    CREATE TABLE IF NOT EXISTS promo_redemptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT,
+        user_id INTEGER,
+        amount REAL,
+        wager_required INTEGER,
+        wager_progress INTEGER DEFAULT 0,
+        last_counted_round TEXT DEFAULT '',
+        active INTEGER DEFAULT 1,
+        redeemed_at TEXT
+    )
+    """)
+
+# Admin command: /code <amount> <wager_required>
+async def admin_create_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # only admins
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Bạn không có quyền sử dụng lệnh này.")
+        return
+
+    # parse args
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("⚠️ Cú pháp: /code <số_tiền> <số_vòng_cược>\nVD: /code 50000 10")
+        return
+    try:
+        amount = int(float(context.args[0]))
+        wager_required = int(context.args[1])
+        if amount <= 0 or wager_required <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("⚠️ Tham số không hợp lệ. Ví dụ: /code 50000 10")
+        return
+
+    # create tables if needed
+    ensure_promo_tables()
+
+    # generate unique code (8 hex chars)
+    code = secrets.token_hex(4).upper()
+    created_at = now_iso()
+    try:
+        db_execute("INSERT INTO promo_codes(code, amount, wager_required, used, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                   (code, amount, wager_required, 0, user_id, created_at))
+    except Exception as e:
+        logger.exception("Failed to create promo code")
+        await update.message.reply_text("❌ Tạo code thất bại, thử lại sau.")
+        return
+
+    await update.message.reply_text(
+        f"✅ Code khuyến mãi đã tạo!\n"
+        f"🎟 Code: `{code}`\n"
+        f"💰 Giá trị: {int(amount):,}₫\n"
+        f"🔁 Phải cược: {wager_required} vòng\n\n"
+        f"Người dùng nhập: /nhancode {code}",
+        parse_mode="Markdown"
+    )
+
+# User command to redeem: /nhancode <CODE>
+async def redeem_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    if not context.args:
+        await update.message.reply_text("⚠️ Cú pháp: /nhancode <CODE>")
+        return
+    code = context.args[0].strip().upper()
+    ensure_promo_tables()
+
+    rows = db_query("SELECT code, amount, wager_required, used FROM promo_codes WHERE code=?", (code,))
+    if not rows:
+        await update.message.reply_text("❌ Code không tồn tại.")
+        return
+    row = rows[0]
+    if row["used"] == 1:
+        await update.message.reply_text("❌ Code này đã được sử dụng.")
+        return
+
+    # Mark code used (single-use)
+    try:
+        db_execute("UPDATE promo_codes SET used=1 WHERE code=?", (code,))
+    except Exception:
+        logger.exception("Failed to mark promo code used")
+        await update.message.reply_text("❌ Lỗi, thử lại sau.")
+        return
+
+    amount = row["amount"]
+    wager_required = int(row["wager_required"])
+
+    # ensure user row exists and credit amount
+    ensure_user(user_id, user.username or "", user.first_name or "")
+    add_balance(user_id, amount)
+
+    redeemed_at = now_iso()
+    # Insert redemption tracking
+    db_execute("INSERT INTO promo_redemptions(code, user_id, amount, wager_required, wager_progress, last_counted_round, active, redeemed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+               (code, user_id, amount, wager_required, 0, "", 1, redeemed_at))
+
+    await update.message.reply_text(
+        f"🎁 Bạn đã nhận *{int(amount):,}₫* từ code `{code}`.\n"
+        f"🔁 Phải cược: *{wager_required}* vòng (mỗi vòng tính 1 lần bạn cược trong mỗi phiên).",
+        parse_mode="Markdown"
+    )
+
+    # Optionally notify admins
+    try:
+        for aid in ADMIN_IDS:
+            await context.bot.send_message(chat_id=aid, text=f"User {user_id} redeemed code {code} amount={int(amount):,} wager={wager_required}")
+    except Exception:
+        pass
+
+# Helper: update wager progress when user places a bet in a specific round
+async def update_promo_wager_progress(context: ContextTypes.DEFAULT_TYPE, user_id: int, round_id: str):
+    """
+    Called each time a user places a bet for round_id.
+    For each active redemption for this user, if last_counted_round != round_id, increment progress by 1.
+    When progress >= required => mark active=0 and notify user.
+    """
+    ensure_promo_tables()
+    try:
+        rows = db_query("SELECT id, code, wager_required, wager_progress, last_counted_round, active, amount FROM promo_redemptions WHERE user_id=? AND active=1", (user_id,))
+        if not rows:
+            return
+        for r in rows:
+            rid = r["id"]
+            last = r["last_counted_round"] or ""
+            if str(last) == str(round_id):
+                # already counted this round for this redemption
+                continue
+            new_progress = (r["wager_progress"] or 0) + 1
+            active = 1
+            if new_progress >= (r["wager_required"] or 0):
+                active = 0
+            db_execute("UPDATE promo_redemptions SET wager_progress=?, last_counted_round=?, active=? WHERE id=?", (new_progress, str(round_id), active, rid))
+            # notify user if completed
+            if active == 0:
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=f"✅ Bạn đã hoàn thành yêu cầu cược cho code {r['code']}! Tiền {int(r['amount']):,}₫ hiện đã hợp lệ.")
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Error in update_promo_wager_progress")
+
+# NOTE: call update_promo_wager_progress from bet handler after inserting bet.
+# In your bet_message_handler, right after you compute round_id and insert bet into DB, add:
+#    await update_promo_wager_progress(context, user.id, round_id)
+# This ensures we count one 'vòng' for that user's active redemptions.
 # -----------------------
 # GROUP / BATDAU / APPROVAL
 # -----------------------
@@ -577,43 +758,6 @@ async def approve_callback_handler(update: Update, context: ContextTypes.DEFAULT
 def get_active_groups() -> List[Dict[str, Any]]:
     rows = db_query("SELECT chat_id, bet_mode, last_round FROM groups WHERE approved=1 AND running=1")
     return [dict(r) for r in rows]
-
-# ===================== NGƯỜI DÙNG NHẬP CODE =====================
-user_bonus_history = {}  # {user_id: set(code)}
-
-async def redeem_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        code = context.args[0].upper()
-    except IndexError:
-        await update.message.reply_text("⚠️ Cú pháp: /nhancode <CODE>")
-        return
-
-    if code not in promo_codes:
-        await update.message.reply_text("❌ Code không tồn tại.")
-        return
-
-    if promo_codes[code]["used"]:
-        await update.message.reply_text("❌ Code này đã được sử dụng.")
-        return
-
-    # Kiểm tra nếu user đã nhập code này trước đó
-    if user_id in user_bonus_history and code in user_bonus_history[user_id]:
-        await update.message.reply_text("⚠️ Bạn đã nhập code này rồi.")
-        return
-
-    # Cộng tiền vào tài khoản user
-    amount = promo_codes[code]["amount"]
-    wager_required = promo_codes[code]["wager_required"]
-    update_user_balance(user_id, amount)  # hàm bạn đã có sẵn để cộng tiền
-
-    promo_codes[code]["used"] = True
-    user_bonus_history.setdefault(user_id, set()).add(code)
-
-    await update.message.reply_text(
-        f"🎁 Bạn đã nhận {amount:,}đ thành công!\n"
-        f"🔄 Vòng cược yêu cầu: {wager_required} vòng.\nChúc bạn may mắn 🍀"
-    )
 
 # -----------------------
 # ROUND ENGINE
