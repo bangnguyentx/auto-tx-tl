@@ -873,7 +873,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
     # Hook startup and shutdown (hỗ trợ async lifecycle)
-    app.post_init(on_startup)
+    app.post_init = on_startup
     app.on_shutdown.append(on_shutdown)
 
     # Exception handler cho loop
