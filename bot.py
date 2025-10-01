@@ -1,5 +1,3 @@
-
-
 # bot.py
 # Telegram Tài Xỉu Bot — Hoàn chỉnh, nhiều chú giải, phù hợp deploy Render (worker)
 # - Phiên: 60 giây
@@ -801,34 +799,45 @@ async def run_round_for_group(app: Application, chat_id: int):
 # STARTUP / SHUTDOWN HANDLERS
 # -----------------------
 
+import asyncio
+from telegram.ext import Application
+
 async def on_startup(app: Application):
     logger.info("Bot starting up...")
-    # ensure DB
+    # Đảm bảo DB đã được khởi tạo
     init_db()
-    # Schedule rounds loop
-    app.create_task(rounds_loop(app))
-    # Inform admins that bot started
+
+    # ✅ Chờ 1 chút để bot thực sự vào vòng lặp event
+    await asyncio.sleep(1)
+
+    # ✅ Tạo task đúng cách sau khi vòng lặp event đã sẵn sàng
+    loop = asyncio.get_running_loop()
+    loop.create_task(rounds_loop(app))
+
+    # Gửi thông báo tới admin khi bot khởi động
     for aid in ADMIN_IDS:
         try:
-            await app.bot.send_message(chat_id=aid, text="Bot đã khởi động và sẵn sàng.")
+            await app.bot.send_message(chat_id=aid, text="✅ Bot đã khởi động và sẵn sàng.")
         except Exception:
             pass
+
 
 async def on_shutdown(app: Application):
     logger.info("Bot shutting down...")
-    # Inform admins on shutdown
+    # Gửi thông báo tới admin khi bot tắt
     for aid in ADMIN_IDS:
         try:
-            await app.bot.send_message(chat_id=aid, text="Bot đang tắt (shutdown).")
+            await app.bot.send_message(chat_id=aid, text="⚠️ Bot đang tắt (shutdown).")
         except Exception:
             pass
 
-# Exception handler for loop-level exceptions
+
+# Exception handler cho lỗi cấp vòng lặp
 def handle_loop_exception(loop, context):
     msg = context.get("exception", context.get("message"))
     logger.error(f"Caught exception in event loop: {msg}")
-    # Asynchronously notify admins via background task if app exists
-    # We cannot call bot methods here because we don't have app context; but we will rely on try/except in other places.
+    # Không gửi tin nhắn ở đây vì không có context của bot
+
 
 # -----------------------
 # MAIN: Build Application & Handlers
@@ -844,7 +853,6 @@ def main():
 
     # Build application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     # Register handlers - commands
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("game", game_info))
@@ -877,7 +885,7 @@ def main():
     app.post_shutdown = on_shutdown
 
     # Exception handler cho loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_loop_exception)
 
     # Run polling
