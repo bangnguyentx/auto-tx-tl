@@ -889,9 +889,8 @@ def main():
     # Exception handler cho loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-     
-loop.set_exception_handler(handle_loop_exception)
+         
+    loop.set_exception_handler(handle_loop_exception)
 
     # Run polling
     try:
