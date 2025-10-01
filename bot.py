@@ -842,6 +842,8 @@ def handle_loop_exception(loop, context):
 # -----------------------
 # MAIN: Build Application & Handlers
 # -----------------------
+import asyncio
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
@@ -881,12 +883,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
     # Hook startup and shutdown (hỗ trợ async lifecycle)
-    app.post_init = on_startup
-    app.post_shutdown = on_shutdown
+     app.post_init = on_startup
+     app.post_shutdown = on_shutdown
 
     # Exception handler cho loop
-    loop = asyncio.get_running_loop()
-    loop.set_exception_handler(handle_loop_exception)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+     
+loop.set_exception_handler(handle_loop_exception)
 
     # Run polling
     try:
