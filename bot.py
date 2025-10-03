@@ -345,53 +345,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 # -----------------------
 # Withdraw handlers
 # -----------------------
-async def ruttien_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = ("Để rút tiền: /ruttien <Ngân hàng> <Số tài khoản> <Số tiền>\n"
-            "Rút tối thiểu 100000 vnđ.\n"
-            "Bạn phải cược đủ 0.9 vòng của tổng đã nạp.")
-    await update.message.reply_text(text)
-
-async def ruttien_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user.id, user.username or "", user.first_name or "")
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("Sai cú pháp. Ví dụ: /ruttien Vietcombank 0123456789 100000")
-        return
-    bank = args[0]; account = args[1]
-    try:
-        amount = int(args[2])
-    except:
-        await update.message.reply_text("Số tiền không hợp lệ.")
-        return
-    if amount < 100000:
-        await update.message.reply_text("Rút tối thiểu 100000 vnđ.")
-        return
-    u = get_user(user.id)
-    if not u:
-        await update.message.reply_text("Không tìm thấy tài khoản.")
-        return
-    total_deposited = u["total_deposited"] or 0.0
-    total_bet_volume = u["total_bet_volume"] or 0.0
-    required = 0.9 * total_deposited
-    if total_deposited > 0 and total_bet_volume < required:
-        await update.message.reply_text(f"Bạn chưa cược đủ. Cần cược tối thiểu {required:,.0f} (đã cược {total_bet_volume:,.0f}).")
-        return
-    if amount > u["balance"]:
-        await update.message.reply_text("Số dư không đủ.")
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Thành công", callback_data=f"withdraw_ok|{user.id}|{amount}|{bank}|{account}"),
-         InlineKeyboardButton("Từ chối", callback_data=f"withdraw_no|{user.id}|{amount}|{bank}|{account}")]
-    ])
-    await update.message.reply_text("Vui lòng chờ, nếu sau 1 tiếng chưa thấy thông báo Thành công/Từ chối thì nhắn admin nhé!")
-    text = f"YÊU CẦU RÚT TIỀN\nUser: @{user.username or user.first_name} (id: {user.id})\nBank: {bank}\nAccount: {account}\nAmount: {amount:,}₫"
-    for aid in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=aid, text=text, reply_markup=kb)
-        except Exception:
-            logger.exception("Cannot notify admin for withdraw")
-
 async def withdraw_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -399,75 +352,136 @@ async def withdraw_callback_handler(update: Update, context: ContextTypes.DEFAUL
     if len(parts) < 5:
         await query.edit_message_text("Dữ liệu không hợp lệ.")
         return
+
     action = parts[0]
     try:
-        user_id = int(parts[1]); amount = int(parts[2]); bank = parts[3]; account = parts[4]
+        user_id = int(parts[1])
+        amount = int(parts[2])
+        bank = parts[3]
+        account = parts[4]
     except:
         await query.edit_message_text("Dữ liệu không hợp lệ.")
         return
+
+    # ✅ Chỉ admin mới có quyền duyệt
     if query.from_user.id not in ADMIN_IDS:
         await query.edit_message_text("Chỉ admin mới thao tác.")
         return
+
+    # ✅ Nếu admin duyệt rút tiền
     if action == "withdraw_ok":
         u = get_user(user_id)
         if not u:
             await query.edit_message_text("User không tồn tại.")
             return
+
+        # 📌 1️⃣ Kiểm tra số dư
         if u["balance"] < amount:
             await query.edit_message_text("User không đủ tiền.")
             try:
-                await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ bị từ chối: số dư không đủ.")
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Yêu cầu rút {amount:,}₫ bị từ chối: số dư không đủ."
+                )
             except:
                 pass
             return
+
+        # 📌 2️⃣ Giới hạn rút tối đa 1.000.000đ/ngày
+        today = datetime.utcnow().date()
+        total_today = db_query_one(
+            "SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE user_id=? AND DATE(created_at)=?",
+            (user_id, today.isoformat())
+        )[0]
+
+        if total_today + amount > 1_000_000:
+            await query.edit_message_text(f"Yêu cầu rút {amount:,}₫ bị từ chối (vượt giới hạn 1.000.000đ/ngày).")
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Bạn đã vượt giới hạn rút tối đa 1.000.000₫ trong ngày. Hãy thử lại vào ngày mai."
+                )
+            except:
+                pass
+            return
+
+        # 📌 3️⃣ Cập nhật số dư
         new_bal = u["balance"] - amount
         db_execute("UPDATE users SET balance=? WHERE user_id=?", (new_bal, user_id))
-        await query.edit_message_text(f"Đã xác nhận rút {amount:,}₫ cho user {user_id}.")
+
+        # 📌 4️⃣ Ghi lịch sử rút
+        db_execute(
+            "INSERT INTO withdrawals (user_id, amount, created_at) VALUES (?, ?, ?)",
+            (user_id, amount, datetime.utcnow().isoformat())
+        )
+
+        # 📌 5️⃣ Gửi thông báo
+        await query.edit_message_text(f"✅ Đã xác nhận rút {amount:,}₫ cho user {user_id}.")
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ đã được duyệt bởi admin.")
-        except:
-            pass
-    else:
-        await query.edit_message_text(f"Yêu cầu rút {amount:,}₫ đã bị từ chối bởi admin {query.from_user.id}.")
-        try:
-            await context.bot.send_message(chat_id=user_id, text=f"Yêu cầu rút {amount:,}₫ đã bị từ chối.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Yêu cầu rút {amount:,}₫ đã được duyệt bởi admin.\nNgân hàng: {bank}\nSố TK: {account}"
+            )
         except:
             pass
 
-# -----------------------
-# Bet handling (group)
-# - /T<amount> and /X<amount>, hide balance reply
-# -----------------------
+    # ❌ Nếu admin từ chối
+    else:
+        await query.edit_message_text(
+            f"Yêu cầu rút {amount:,}₫ đã bị từ chối bởi admin {query.from_user.id}."
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Yêu cầu rút {amount:,}₫ đã bị từ chối."
+            )
+        except:
+            pass
+        
+# -----------------------------
+# ✅ BET HANDLER (T/X + /T/X)
+# -----------------------------
 async def bet_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
+
     text = msg.text.strip()
-    if not text.startswith("/"):
-        return
-    user = update.effective_user
-    chat = update.effective_chat
-    cmd = text[1:]
+    # ✅ Chấp nhận cả /T1000, /X1000 và T1000, X1000
+    if text.startswith("/"):
+        cmd = text[1:]
+    else:
+        cmd = text
+
     if len(cmd) < 2:
         return
+
     prefix = cmd[0].lower()
-    if prefix not in ("t","x"):
+    if prefix not in ("t", "x"):
         return
+
     side = "tai" if prefix == "t" else "xiu"
+
+    # ✅ Parse tiền cược
     try:
         amount = int(cmd[1:])
     except:
-        await msg.reply_text("Cú pháp đặt cược sai. Ví dụ: /T1000 hoặc /X5000")
-        return
-    if amount < MIN_BET:
-        await msg.reply_text(f"Đặt cược tối thiểu {MIN_BET:,}₫")
+        await msg.reply_text("❌ Cú pháp đặt cược sai. Ví dụ: /T1000 hoặc X5000")
         return
 
-    if chat.type not in ("group","supergroup"):
+    if amount < MIN_BET:
+        await msg.reply_text(f"⚠️ Đặt cược tối thiểu {MIN_BET:,}₫")
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+
+    # ✅ Chỉ cho phép cược trong group
+    if chat.type not in ("group", "supergroup"):
         await msg.reply_text("Lệnh cược chỉ dùng trong nhóm.")
         return
 
-    # check group approved/running
+    # ✅ Kiểm tra nhóm đã duyệt & đang chạy
     g = db_query("SELECT approved, running FROM groups WHERE chat_id=?", (chat.id,))
     if not g or g[0]["approved"] != 1 or g[0]["running"] != 1:
         await msg.reply_text("Nhóm này chưa được admin duyệt hoặc chưa bật /batdau.")
@@ -475,23 +489,28 @@ async def bet_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     ensure_user(user.id, user.username or "", user.first_name or "")
     u = get_user(user.id)
-    if (u["balance"] or 0.0) < amount:
-        await msg.reply_text("Số dư không đủ.")
+    if not u or (u["balance"] or 0.0) < amount:
+        await msg.reply_text("❌ Số dư không đủ.")
         return
 
-    # deduct immediately and update total bet
+    # ✅ Trừ tiền ngay & cộng tổng cược
     new_balance = (u["balance"] or 0.0) - amount
     new_total_bet = (u["total_bet_volume"] or 0.0) + amount
-    db_execute("UPDATE users SET balance=?, total_bet_volume=? WHERE user_id=?", (new_balance, new_total_bet, user.id))
+    db_execute(
+        "UPDATE users SET balance=?, total_bet_volume=? WHERE user_id=?",
+        (new_balance, new_total_bet, user.id)
+    )
 
-    # insert bet
+    # ✅ Lưu cược vào DB
     now_ts = int(datetime.utcnow().timestamp())
     round_epoch = now_ts // ROUND_SECONDS
     round_id = f"{chat.id}_{round_epoch}"
-    db_execute("INSERT INTO bets(chat_id, round_id, user_id, side, amount, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-               (chat.id, round_id, user.id, side, amount, now_iso()))
-    # update start bonus progress & promo redemptions
-    # increment start bonus progress if user had start bonus
+    db_execute(
+        "INSERT INTO bets(chat_id, round_id, user_id, side, amount, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat.id, round_id, user.id, side, amount, now_iso())
+    )
+
+    # ✅ Update bonus start progress nếu có
     try:
         rows = db_query("SELECT start_bonus_given, start_bonus_progress FROM users WHERE user_id=?", (user.id,))
         if rows and rows[0]["start_bonus_given"] == 1:
@@ -499,15 +518,15 @@ async def bet_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             db_execute("UPDATE users SET start_bonus_progress=? WHERE user_id=?", (new_prog, user.id))
     except Exception:
         logger.exception("start bonus progress update failed")
-    # update promo redemptions progress
+
+    # ✅ Update promo wager progress nếu có
     try:
         await update_promo_wager_progress(context, user.id, round_id)
     except Exception:
         logger.exception("promo progress failed")
 
-    # reply without balance
-    await msg.reply_text(f"Đã đặt {side.upper()} {amount:,}₫ cho phiên hiện tại.")
-
+    # ✅ Phản hồi không kèm số dư
+    await msg.reply_text(f"✅ Đã đặt {side.upper()} {amount:,}₫ cho phiên hiện tại.")
 # -----------------------
 # Admin handlers
 # -----------------------
@@ -780,41 +799,95 @@ async def run_round_for_group(app: Application, chat_id: int, round_epoch: int):
         db_execute("INSERT INTO history(chat_id, round_index, round_id, result, dice, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                    (chat_id, round_index, round_id, result, dice_str, now_iso()))
 
-        # compute winners/losers
-        winners = []
-        losers = []
-        total_winner_bets = 0.0
-        total_loser_bets = 0.0
-        for b in bets:
-            if b["side"] == result:
-                winners.append((b["user_id"], b["amount"]))
-                total_winner_bets += b["amount"]
-            else:
-                losers.append((b["user_id"], b["amount"]))
-                total_loser_bets += b["amount"]
+        # ----- Compute winners/losers (robust/atomic updates) -----
+winners = []
+losers = []
+total_winner_bets = 0.0
+total_loser_bets = 0.0
 
-        # losers to pot
-        if total_loser_bets > 0:
-            add_to_pot(total_loser_bets)
+for b in bets:
+    if b["side"] == result:
+        winners.append((b["user_id"], b["amount"]))
+        total_winner_bets += float(b["amount"] or 0.0)
+    else:
+        losers.append((b["user_id"], b["amount"]))
+        total_loser_bets += float(b["amount"] or 0.0)
 
-        winners_paid = []
-        for uid, amt in winners:
-            house_share = amt * HOUSE_RATE
-            add_to_pot(house_share)
-            payout = amt * WIN_MULTIPLIER
-            ensure_user(uid, "", "")
-            u = get_user(uid)
-            new_balance = (u["balance"] or 0.0) + payout
-            cur_streak = (u["current_streak"] or 0) + 1
-            best_streak = max(u["best_streak"] or 0, cur_streak)
-            db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, cur_streak, best_streak, uid))
-            winners_paid.append((uid, payout, amt))
+# Add losers' money to pot (atomic)
+try:
+    if total_loser_bets > 0:
+        db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
+except Exception:
+    logger.exception("Failed to add losers to pot")
 
-        for uid, amt in losers:
-            rows = db_query("SELECT current_streak FROM users WHERE user_id=?", (uid,))
-            if rows:
-                db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+winners_paid = []
 
+# Pay winners (use SQL atomic updates to avoid race conditions)
+for uid, amt in winners:
+    try:
+        amt = float(amt or 0.0)
+        # compute house share and payout as integers (round)
+        house_share = round(amt * HOUSE_RATE)
+        payout = round(amt * WIN_MULTIPLIER)
+
+        # ensure user exists
+        ensure_user(uid, "", "")
+
+        # add house share to pot
+        if house_share > 0:
+            try:
+                db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (house_share,))
+            except Exception:
+                logger.exception("Failed to add house share to pot")
+
+        # Update user's balance and streaks atomically
+        # Use COALESCE to handle possible NULLs
+        try:
+            db_execute(
+                """
+                UPDATE users SET
+                    balance = COALESCE(balance, 0) + ?,
+                    current_streak = COALESCE(current_streak, 0) + 1,
+                    best_streak = CASE
+                        WHEN COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
+                        THEN COALESCE(current_streak, 0) + 1
+                        ELSE COALESCE(best_streak, 0)
+                    END
+                WHERE user_id = ?
+                """,
+                (payout, uid)
+            )
+        except Exception:
+            # fallback: try simple update after reading user
+            logger.exception("Atomic update failed for user streak/balance, trying fallback")
+            u = get_user(uid) or {"balance": 0, "current_streak": 0, "best_streak": 0}
+            new_balance = (u.get("balance") or 0) + payout
+            new_cur = (u.get("current_streak") or 0) + 1
+            new_best = max(u.get("best_streak") or 0, new_cur)
+            db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, new_cur, new_best, uid))
+
+        winners_paid.append((uid, int(payout), int(amt)))
+    except Exception as e:
+        logger.exception(f"Error paying winner {uid}: {e}")
+        # try notify admin about this particular payment error
+        for aid in ADMIN_IDS:
+            try:
+                app.bot.send_message(chat_id=aid, text=f"ERROR paying winner {uid} in group {chat_id}: {e}")
+            except Exception:
+                pass
+
+# Reset streak for losers (atomic)
+for uid, amt in losers:
+    try:
+        db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+    except Exception:
+        logger.exception(f"Failed to reset streak for user {uid}")
+
+# Remove bets for this round (done after settlement)
+try:
+    db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+except Exception:
+    logger.exception("Failed to delete bets for round after settlement")
         # special triple distribute pot
         special_msg = ""
         if special in ("triple1","triple6"):
