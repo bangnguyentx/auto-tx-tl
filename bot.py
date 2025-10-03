@@ -1292,76 +1292,62 @@ async def run_round_for_group(app, chat_id, round_epoch):
             logger.exception("Failed to insert history")
 
         # ------- Tính winners/losers -------
-        winners = []
-        losers = []
-        total_winner_bets = 0.0
-        total_loser_bets = 0.0
-        for b in bets:
-            amt_f = float(b.get("amount") or 0.0)
-            if b.get("side") == result:
-                winners.append((int(b["user_id"]), amt_f))
-                total_winner_bets += amt_f
-            else:
-                losers.append((int(b["user_id"]), amt_f))
-                total_loser_bets += amt_f
+winners = []
+losers = []
+total_winner_bets = 0.0
+total_loser_bets = 0.0
+for b in bets:
+    amt_f = float(b.get("amount") or 0.0)
+    if b.get("side") == result:
+        winners.append((int(b["user_id"]), amt_f))
+        total_winner_bets += amt_f
+    else:
+        losers.append((int(b["user_id"]), amt_f))
+        total_loser_bets += amt_f
 
-        # Losers -> pot
-        try:
-            if total_loser_bets > 0:
-                db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
-        except Exception:
-            logger.exception("Failed to add losers to pot")
+# Losers -> pot
+try:
+    if total_loser_bets > 0:
+        db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
+except Exception:
+    logger.exception("Failed to add losers to pot")
 
-        winners_paid = []
-        # Pay winners (atomic-ish)
-        for uid, amt in winners:
+# -------- TRẢ THƯỞNG --------
+winners_paid = []
+for uid, amt in winners:
+    try:
+        house_share = amt * HOUSE_RATE
+        payout = amt * WIN_MULTIPLIER
+
+        # cộng house share vào pot
+        if house_share > 0:
             try:
-                house_share = amt * HOUSE_RATE
-                payout = amt * WIN_MULTIPLIER
-
-                # add house share to pot
-                if house_share > 0:
-                    try:
-                        db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (house_share,))
-                    except Exception:
-                        logger.exception("Failed to add house share to pot")
-
-                # ensure user row exists
-                ensure_user(uid, "", "")
-                # update user balance + streaks
-                try:
-                    db_execute(
-                        """
-                        UPDATE users SET
-                            balance = COALESCE(balance, 0) + ?,
-                            current_streak = COALESCE(current_streak, 0) + 1,
-                            best_streak = CASE
-                                WHEN COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
-                                THEN COALESCE(current_streak, 0) + 1
-                                ELSE COALESCE(best_streak, 0)
-                            END
-                        WHERE user_id = ?
-                        """,
-                        (payout, uid)
-                    )
-                except Exception:
-                    # fallback safe update
-                    u = get_user(uid) or {"balance": 0, "current_streak": 0, "best_streak": 0}
-                    new_balance = (u.get("balance") or 0) + payout
-                    new_cur = (u.get("current_streak") or 0) + 1
-                    new_best = max(u.get("best_streak") or 0, new_cur)
-                    db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, new_cur, new_best, uid))
-
-                winners_paid.append((uid, payout, amt))
+                db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (house_share,))
             except Exception:
-                logger.exception(f"Error paying winner {uid}")
+                logger.exception("Failed to add house share to pot")
 
-        # Reset streaks for losers
-        for uid, _ in losers:
-            try:
-                db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
-            except Exception:
-                logger.exception(f"Failed to reset streak for user {uid}")
+        # đảm bảo user tồn tại
+        ensure_user(uid, "", "")
+
+        # cộng tiền thắng cho user
+        db_execute(
+            """
+            UPDATE users SET
+                balance = COALESCE(balance, 0) + ?,
+                current_streak = COALESCE(current_streak, 0) + 1,
+                best_streak = CASE
+                    THEN COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
+                    THEN COALESCE(current_streak, 0) + 1
+                    ELSE COALESCE(best_streak, 0)
+                END
+            WHERE user_id = ?
+            """,
+            (payout, uid)
+        )
+
+        winners_paid.append((uid, payout, amt))
+    except Exception:
+        logger.exception(f"Error paying winner {uid}")
 
         # Special triple distributions (3x1 or 3x6) -> share pot proportionally
         special_msg = ""
