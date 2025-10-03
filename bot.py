@@ -1156,7 +1156,82 @@ async def rounds_loop(app: Application):
 # -----------------------
 # Startup / Shutdown + Main entrypoint (PTB v20+ chuẩn)
 # -----------------------
+import random
+import traceback
 
+async def run_round_for_group(app, chat_id, round_epoch):
+    """
+    Xử lý 1 vòng chơi Tài/Xỉu cho nhóm.
+    Gồm: quay xúc xắc, xác định kết quả, tính thắng thua, cộng tiền, gửi thông báo.
+    """
+    try:
+        # ---- 1️⃣ Lấy danh sách cược của nhóm ----
+        bets = db_query("SELECT user_id, side, amount FROM bets WHERE chat_id=?", (chat_id,))
+        if not bets:
+            logger.info(f"Không có cược trong round cho group {chat_id}")
+            return
+
+        # ---- 2️⃣ Random xúc xắc ----
+        dice = [random.randint(1, 6) for _ in range(3)]
+        total = sum(dice)
+        result = "tai" if total >= 11 else "xiu"
+
+        # ---- 3️⃣ Xử lý thắng/thua ----
+        winners = []
+        losers = []
+        for b in bets:
+            if b["side"] == result:
+                winners.append((b["user_id"], b["amount"]))
+            else:
+                losers.append((b["user_id"], b["amount"]))
+
+        # Tổng tiền thua → bỏ vào hũ
+        total_loser_bets = sum(amt for (_, amt) in losers)
+        if total_loser_bets > 0:
+            add_to_pot(total_loser_bets)
+
+        # ---- 4️⃣ Trả tiền người thắng ----
+        winners_paid = []
+        for uid, amt in winners:
+            ensure_user(uid, "", "")
+            u = get_user(uid)
+            payout = amt * WIN_MULTIPLIER
+            new_balance = (u["balance"] or 0.0) + payout
+            db_execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, uid))
+            winners_paid.append((uid, payout, amt))
+
+        # Reset streak cho người thua
+        for uid, _ in losers:
+            db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+
+        # ---- 5️⃣ Xoá cược sau vòng chơi ----
+        db_execute("DELETE FROM bets WHERE chat_id=?", (chat_id,))
+
+        # ---- 6️⃣ Gửi kết quả ra nhóm ----
+        display = "Tài" if result == "tai" else "Xỉu"
+        symbol = BLACK if result == "tai" else WHITE
+        msg = f"▶️ Kết quả: {display} {symbol}\n"
+        msg += f"🎲 Xúc xắc: {' '.join([DICE_CHARS[d-1] for d in dice])} — Tổng: {total}\n"
+
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception:
+            logger.exception("Không gửi được kết quả vòng chơi")
+
+        # ---- 7️⃣ Gửi báo cáo cho admin ----
+        if winners_paid:
+            admin_summary = f"[Round @ {chat_id}] ✅ {result.upper()}\n"
+            for uid, payout, amt in winners_paid:
+                admin_summary += f"- {uid}: {int(amt):,} → +{int(payout):,}\n"
+            for aid in ADMIN_IDS:
+                try:
+                    await app.bot.send_message(chat_id=aid, text=admin_summary)
+                except:
+                    pass
+
+    except Exception as e:
+        logger.exception(f"Exception in run_round_for_group for chat {chat_id}: {e}\n{traceback.format_exc()}")
+        
 async def on_startup(app: Application):
     """Hàm chạy khi bot khởi động."""
     logger.info("Bot starting up...")
