@@ -989,7 +989,7 @@ async def run_round_for_group(app: Application, chat_id: int):
             logger.exception("Cannot send round result to group")
 
         # --- Gửi tóm tắt cho admin (nếu cần) ---
-        try:
+try:
     if winners_paid:
         admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
         for uid, payout, amt in winners_paid:
