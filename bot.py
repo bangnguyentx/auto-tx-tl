@@ -1156,81 +1156,250 @@ async def rounds_loop(app: Application):
 # -----------------------
 # Startup / Shutdown + Main entrypoint (PTB v20+ chuẩn)
 # -----------------------
-import random
 import traceback
+import asyncio
+import random
 
 async def run_round_for_group(app, chat_id, round_epoch):
     """
-    Xử lý 1 vòng chơi Tài/Xỉu cho nhóm.
-    Gồm: quay xúc xắc, xác định kết quả, tính thắng thua, cộng tiền, gửi thông báo.
+    Xử lý 1 vòng chơi cho group chat_id.
+    round_epoch được rounds_loop tính sẵn -> dùng để tạo round_id nhất quán.
     """
     try:
-        # ---- 1️⃣ Lấy danh sách cược của nhóm ----
-        bets = db_query("SELECT user_id, side, amount FROM bets WHERE chat_id=?", (chat_id,))
-        if not bets:
-            logger.info(f"Không có cược trong round cho group {chat_id}")
-            return
+        round_index = int(round_epoch)
+        round_id = f"{chat_id}_{round_epoch}"
 
-        # ---- 2️⃣ Random xúc xắc ----
-        dice = [random.randint(1, 6) for _ in range(3)]
-        total = sum(dice)
-        result = "tai" if total >= 11 else "xiu"
+        # lấy cược cho chính round này (chỉ round_id hiện tại)
+        bets_rows = db_query("SELECT user_id, side, amount FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+        bets = [dict(r) for r in bets_rows] if bets_rows else []
 
-        # ---- 3️⃣ Xử lý thắng/thua ----
+        # lấy chế độ nhóm (force/bettai...)
+        grows = db_query("SELECT bet_mode FROM groups WHERE chat_id=?", (chat_id,))
+        bet_mode = grows[0]["bet_mode"] if grows else "random"
+
+        # quyết định forcedValue nếu admin đã set
+        forced_value = None
+        if bet_mode == "force_tai":
+            forced_value = "tai"
+            # revert one-shot
+            db_execute("UPDATE groups SET bet_mode='random' WHERE chat_id=?", (chat_id,))
+        elif bet_mode == "force_xiu":
+            forced_value = "xiu"
+            db_execute("UPDATE groups SET bet_mode='random' WHERE chat_id=?", (chat_id,))
+        elif bet_mode == "bettai":
+            forced_value = "tai"
+        elif bet_mode == "betxiu":
+            forced_value = "xiu"
+
+        # Gửi thông báo bắt đầu/quay (GIF nếu có)
+        try:
+            # nếu bạn có biến DICE_SPIN_GIF_URL (đặt ở đầu file) dùng GIF 3D, nếu không có sẽ bỏ qua
+            if 'DICE_SPIN_GIF_URL' in globals() and DICE_SPIN_GIF_URL:
+                try:
+                    await app.bot.send_animation(chat_id=chat_id, animation=DICE_SPIN_GIF_URL, caption="🔄 Quay xúc xắc...")
+                    await asyncio.sleep(0.8)
+                except Exception:
+                    pass
+            else:
+                # fallback: 1 tin nhắn text thông báo
+                await app.bot.send_message(chat_id=chat_id, text=f"🎲 Phiên {round_index} — Đang tung xúc xắc...")
+        except Exception:
+            pass
+
+        # Tạo kết quả: nếu có forced_value thì tìm dice phù hợp, còn không thì random từng viên
+        dice = []
+        special = None
+        total = 0
+
+        if forced_value:
+            # generate until match or timeout
+            attempts = 0
+            dice, total, special = roll_three_dice_random()
+            while result_from_total(total) != forced_value and attempts < 200:
+                dice, total, special = roll_three_dice_random()
+                attempts += 1
+            # send GIF already gửi, bây giờ gửi từng viên để hiển thị
+            for v in dice:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=f"{DICE_CHARS[v-1]}")
+                except:
+                    pass
+                await asyncio.sleep(1.0)
+        else:
+            # gửi lần lượt 3 viên, 1s mỗi viên
+            a = roll_one_die(); dice.append(a)
+            try: await app.bot.send_message(chat_id=chat_id, text=f"{DICE_CHARS[a-1]}")
+            except: pass
+            await asyncio.sleep(1.0)
+
+            b = roll_one_die(); dice.append(b)
+            try: await app.bot.send_message(chat_id=chat_id, text=f"{DICE_CHARS[b-1]}")
+            except: pass
+            await asyncio.sleep(1.0)
+
+            c = roll_one_die(); dice.append(c)
+            try: await app.bot.send_message(chat_id=chat_id, text=f"{DICE_CHARS[c-1]}")
+            except: pass
+
+            total = sum(dice)
+            if dice.count(1) == 3:
+                special = "triple1"
+            elif dice.count(6) == 3:
+                special = "triple6"
+
+            # ensure total assigned if not above
+            if total == 0:
+                total = sum(dice)
+
+        # compute final result
+        result = result_from_total(total)
+
+        # persist history
+        dice_str = ",".join(map(str, dice))
+        try:
+            db_execute(
+                "INSERT INTO history(chat_id, round_index, round_id, result, dice, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, round_index, round_id, result, dice_str, now_iso())
+            )
+        except Exception:
+            logger.exception("Failed to insert history")
+
+        # ------- Tính winners/losers -------
         winners = []
         losers = []
+        total_winner_bets = 0.0
+        total_loser_bets = 0.0
         for b in bets:
-            if b["side"] == result:
-                winners.append((b["user_id"], b["amount"]))
+            amt_f = float(b.get("amount") or 0.0)
+            if b.get("side") == result:
+                winners.append((int(b["user_id"]), amt_f))
+                total_winner_bets += amt_f
             else:
-                losers.append((b["user_id"], b["amount"]))
+                losers.append((int(b["user_id"]), amt_f))
+                total_loser_bets += amt_f
 
-        # Tổng tiền thua → bỏ vào hũ
-        total_loser_bets = sum(amt for (_, amt) in losers)
-        if total_loser_bets > 0:
-            add_to_pot(total_loser_bets)
+        # Losers -> pot
+        try:
+            if total_loser_bets > 0:
+                db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
+        except Exception:
+            logger.exception("Failed to add losers to pot")
 
-        # ---- 4️⃣ Trả tiền người thắng ----
         winners_paid = []
+        # Pay winners (atomic-ish)
         for uid, amt in winners:
-            ensure_user(uid, "", "")
-            u = get_user(uid)
-            payout = amt * WIN_MULTIPLIER
-            new_balance = (u["balance"] or 0.0) + payout
-            db_execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, uid))
-            winners_paid.append((uid, payout, amt))
+            try:
+                house_share = amt * HOUSE_RATE
+                payout = amt * WIN_MULTIPLIER
 
-        # Reset streak cho người thua
+                # add house share to pot
+                if house_share > 0:
+                    try:
+                        db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (house_share,))
+                    except Exception:
+                        logger.exception("Failed to add house share to pot")
+
+                # ensure user row exists
+                ensure_user(uid, "", "")
+                # update user balance + streaks
+                try:
+                    db_execute(
+                        """
+                        UPDATE users SET
+                            balance = COALESCE(balance, 0) + ?,
+                            current_streak = COALESCE(current_streak, 0) + 1,
+                            best_streak = CASE
+                                WHEN COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
+                                THEN COALESCE(current_streak, 0) + 1
+                                ELSE COALESCE(best_streak, 0)
+                            END
+                        WHERE user_id = ?
+                        """,
+                        (payout, uid)
+                    )
+                except Exception:
+                    # fallback safe update
+                    u = get_user(uid) or {"balance": 0, "current_streak": 0, "best_streak": 0}
+                    new_balance = (u.get("balance") or 0) + payout
+                    new_cur = (u.get("current_streak") or 0) + 1
+                    new_best = max(u.get("best_streak") or 0, new_cur)
+                    db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, new_cur, new_best, uid))
+
+                winners_paid.append((uid, payout, amt))
+            except Exception:
+                logger.exception(f"Error paying winner {uid}")
+
+        # Reset streaks for losers
         for uid, _ in losers:
-            db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+            try:
+                db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+            except Exception:
+                logger.exception(f"Failed to reset streak for user {uid}")
 
-        # ---- 5️⃣ Xoá cược sau vòng chơi ----
-        db_execute("DELETE FROM bets WHERE chat_id=?", (chat_id,))
+        # Special triple distributions (3x1 or 3x6) -> share pot proportionally
+        special_msg = ""
+        if special in ("triple1", "triple6"):
+            try:
+                pot_amount = get_pot_amount()
+                if pot_amount > 0 and winners:
+                    total_bets_win = sum([amt for (_, amt) in winners]) or 0.0
+                    if total_bets_win > 0:
+                        for uid, amt in winners:
+                            share = (amt / total_bets_win) * pot_amount
+                            ensure_user(uid, "", "")
+                            u = get_user(uid) or {"balance": 0}
+                            db_execute("UPDATE users SET balance=? WHERE user_id=?", ((u["balance"] or 0.0) + share, uid))
+                        special_msg = f"Hũ {int(pot_amount):,}₫ đã được chia cho người thắng theo tỷ lệ cược!"
+                        reset_pot()
+            except Exception:
+                logger.exception("Error distributing special pot")
 
-        # ---- 6️⃣ Gửi kết quả ra nhóm ----
+        # Xóa bets chỉ của round này (không xóa tất cả)
+        try:
+            db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+        except Exception:
+            logger.exception("Failed to delete bets for round")
+
+        # Chuẩn bị và gửi tin nhắn kết quả
         display = "Tài" if result == "tai" else "Xỉu"
         symbol = BLACK if result == "tai" else WHITE
-        msg = f"▶️ Kết quả: {display} {symbol}\n"
-        msg += f"🎲 Xúc xắc: {' '.join([DICE_CHARS[d-1] for d in dice])} — Tổng: {total}\n"
+        history_line = format_history_line(chat_id)
+        msg = f"▶️ Phiên {round_index} — Kết quả: {display} {symbol}\n"
+        msg += f"Xúc xắc: {' '.join([DICE_CHARS[d-1] for d in dice])} — Tổng: {total}\n"
+        if special_msg:
+            msg += f"\n{special_msg}\n"
+        if history_line:
+            msg += f"\nLịch sử ({MAX_HISTORY} gần nhất):\n{history_line}\n"
 
         try:
             await app.bot.send_message(chat_id=chat_id, text=msg)
         except Exception:
-            logger.exception("Không gửi được kết quả vòng chơi")
+            logger.exception("Cannot send round result to group")
 
-        # ---- 7️⃣ Gửi báo cáo cho admin ----
+        # Gửi báo cáo cho admin (nếu có người trúng)
         if winners_paid:
-            admin_summary = f"[Round @ {chat_id}] ✅ {result.upper()}\n"
+            admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
             for uid, payout, amt in winners_paid:
-                admin_summary += f"- {uid}: {int(amt):,} → +{int(payout):,}\n"
+                admin_summary += f"- {uid}: đặt {int(amt):,} -> nhận {int(payout):,}\n"
             for aid in ADMIN_IDS:
                 try:
                     await app.bot.send_message(chat_id=aid, text=admin_summary)
-                except:
+                except Exception:
                     pass
 
+        # Mở lại chat (nếu trước đó bị khoá)
+        try:
+            await unlock_group_chat(app.bot, chat_id)
+        except Exception:
+            pass
+
     except Exception as e:
-        logger.exception(f"Exception in run_round_for_group for chat {chat_id}: {e}\n{traceback.format_exc()}")
+        logger.exception("Exception in run_round_for_group")
+        for aid in ADMIN_IDS:
+            try:
+                await app.bot.send_message(chat_id=aid, text=f"ERROR - run_round_for_group exception for group {chat_id}: {e}\n{traceback.format_exc()}")
+            except Exception:
+                pass
         
 async def on_startup(app: Application):
     """Hàm chạy khi bot khởi động."""
