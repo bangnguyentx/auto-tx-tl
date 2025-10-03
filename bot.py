@@ -1183,7 +1183,51 @@ async def on_shutdown(app: Application):
         except Exception as e:
             logger.warning(f"Không gửi được tin nhắn shutdown cho admin {aid}: {e}")
 
+# ==============================
+# Handler rút tiền (dán trước hàm main)
+# ==============================
+from telegram import Update
+from telegram.ext import ContextTypes
 
+async def ruttien_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý lệnh rút tiền từ người chơi."""
+    try:
+        args = context.args
+        if len(args) < 3:
+            await update.message.reply_text(
+                "⚠️ Cú pháp không đúng!\nDùng: /ruttien <Ngân hàng> <Số TK> <Số tiền>"
+            )
+            return
+
+        bank = args[0]
+        account = args[1]
+        try:
+            amount = int(args[2])
+        except ValueError:
+            await update.message.reply_text("⚠️ Số tiền không hợp lệ.")
+            return
+
+        if amount < 100000:
+            await update.message.reply_text("⚠️ Số tiền rút tối thiểu là 100.000đ.")
+            return
+
+        # (giả lập kiểm tra số dư)
+        balance = 9999999  
+        if amount > balance:
+            await update.message.reply_text("⚠️ Số dư không đủ.")
+            return
+
+        await update.message.reply_text(
+            f"✅ Đã nhận yêu cầu rút {amount:,}đ về {bank} ({account}).\nĐang xử lý..."
+        )
+
+    except Exception as e:
+        await update.message.reply_text("❌ Lỗi hệ thống khi xử lý yêu cầu rút tiền.")
+        print("ruttien_handler error:", e)
+
+# ==============================
+# Hàm main — để nguyên bên dưới
+# ==============================
 def main():
     """Main entrypoint — dùng run_polling() thay cho updater.start_polling()"""
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
