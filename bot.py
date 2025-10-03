@@ -997,7 +997,7 @@ async def run_round_for_group(app: Application, chat_id: int):
                 try:
                     await app.bot.send_message(chat_id=aid, text=admin_summary)
                 except Exception:
-                    pass
+   async                 pass
 
     except Exception as e:
         logger.exception("Exception in run_round_for_group")
@@ -1008,24 +1008,35 @@ async def run_round_for_group(app: Application, chat_id: int):
             except Exception:
                 pass
              
-async def run_round_for_group(app, chat_id):
+async def run_round_for_group(app, chat_id, round_epoch):
     try:
+        # ----- Xử lý xúc xắc + kết quả -----
+        dice = roll_dice(3)
+        total = sum(dice)
+        result = "tai" if total >= 11 else "xiu"  # hoặc tùy luật bạn dùng
+        round_id = round_epoch
+
         # ----- Lấy danh sách cược -----
         bets = db_query("SELECT * FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
 
-        # ----- Tính winners và losers -----
         winners = []
         losers = []
-        total_winner_bets = 0.0
-        total_loser_bets = 0.0
 
         for b in bets:
+            uid = b["user_id"]
+            amt = float(b["amount"] or 0.0)
             if b["side"] == result:
-                winners.append((b["user_id"], b["amount"]))
-                total_winner_bets += float(b["amount"] or 0.0)
+                winners.append((uid, amt))
             else:
-                losers.append((b["user_id"], b["amount"]))
-                total_loser_bets += float(b["amount"] or 0.0)
+                losers.append((uid, amt))
+
+        # ----- Cộng tiền cho winners -----
+        for uid, amt in winners:
+            payout = amt * 2  # thắng ăn gấp đôi, bạn có thể chỉnh nếu cần
+            try:
+                db_execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (payout, uid))
+            except Exception:
+                logger.exception(f"Failed to pay winner {uid}")
 
         # ----- Reset streak cho losers -----
         for uid, amt in losers:
@@ -1034,7 +1045,23 @@ async def run_round_for_group(app, chat_id):
             except Exception:
                 logger.exception(f"Failed to reset streak for user {uid}")
 
-        # (phần xử lý winners_paid, gửi tin nhắn,... ở dưới)
+        # ----- Gửi kết quả vòng -----
+        display = "Tài" if result == "tai" else "Xỉu"
+        symbol = BLACK if result == "tai" else WHITE
+        msg = f"▶️ Phiên {round_id} — Kết quả: {display} {symbol}\n"
+        msg += f"Xúc xắc: {' '.join([DICE_CHARS[d-1] for d in dice])} — Tổng: {total}\n"
+        await app.bot.send_message(chat_id=chat_id, text=msg)
+
+        # ----- Gửi admin summary -----
+        if winners:
+            admin_summary = f"Round {round_id} | Group {chat_id}\nResult: {result}\nWinners:\n"
+            for uid, amt in winners:
+                admin_summary += f"- {uid}: đặt {int(amt):,} → nhận {int(amt*2):,}\n"
+            for aid in ADMIN_IDS:
+                try:
+                    await app.bot.send_message(chat_id=aid, text=admin_summary)
+                except:
+                    pass
 
     except Exception as e:
         logger.exception(f"Exception in run_round_for_group: {e}")
