@@ -1044,6 +1044,12 @@ if special in ("triple1", "triple6"):
         db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
 
         # prepare message
+        async def run_round_for_group(app, chat_id):
+    try:
+        # --- logic xử lý vòng chơi ---
+        # (tính result, winners, losers, settle tiền, v.v...)
+
+        # 🟡 Gửi kết quả cho group
         display = "Tài" if result == "tai" else "Xỉu"
         symbol = BLACK if result == "tai" else WHITE
         history_line = format_history_line(chat_id)
@@ -1058,10 +1064,7 @@ if special in ("triple1", "triple6"):
         except:
             logger.exception("Cannot send round result to group")
 
-async def run_round_for_group(app, chat_id):
-    try:
-        # --- logic xử lý vòng chơi ---
-        # admin summary
+        # 🟢 Gửi tóm tắt cho admin
         if winners_paid:
             admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
             for uid, payout, amt in winners_paid:
@@ -1071,6 +1074,9 @@ async def run_round_for_group(app, chat_id):
                     await app.bot.send_message(chat_id=aid, text=admin_summary)
                 except:
                     pass
+
+    except Exception as e:
+        logger.exception(f"Exception in run_round_for_group: {e}")
 
         # unlock group
         try:
