@@ -1291,33 +1291,33 @@ async def run_round_for_group(app, chat_id, round_epoch):
         except Exception:
             logger.exception("Failed to insert history")
 
-        # ------- Tính winners/losers -------
-try:
-    # làm gì đó có thể lỗi
-    something()
-except Exception:
-    logger.exception("Lỗi trong đoạn trước khi tính winners")
-
 # ------- Tính winners/losers -------
-winners = []
-losers = []
-total_winner_bets = 0.0
-total_loser_bets = 0.0
-for b in bets:
-    amt_f = float(b.get("amount") or 0.0)
-    if b.get("side") == result:
-        winners.append((int(b["user_id"]), amt_f))
-        total_winner_bets += amt_f
-    else:
-        losers.append((int(b["user_id"]), amt_f))
-        total_loser_bets += amt_f
+        try:
+            # làm gì đó có thể lỗi
+            something()
+        except Exception:
+            logger.exception("Lỗi trong đoạn trước khi tính winners")
 
-# Losers -> pot
-try:
-    if total_loser_bets > 0:
-        db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
-except Exception:
-    logger.exception("Failed to add losers to pot")
+        # ------- Tính winners/losers -------
+        winners = []
+        losers = []
+        total_winner_bets = 0.0
+        total_loser_bets = 0.0
+        for b in bets:
+            amt_f = float(b.get("amount") or 0.0)
+            if b.get("side") == result:
+                winners.append((int(b["user_id"]), amt_f))
+                total_winner_bets += amt_f
+            else:
+                losers.append((int(b["user_id"]), amt_f))
+                total_loser_bets += amt_f
+
+        # Losers -> pot
+        try:
+            if total_loser_bets > 0:
+                db_execute("UPDATE pot SET amount = amount + ? WHERE id = 1", (total_loser_bets,))
+        except Exception:
+            logger.exception("Failed to add losers to pot")
 
 # -------- TRẢ THƯỞNG --------
 winners_paid = []
