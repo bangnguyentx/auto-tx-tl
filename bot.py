@@ -1044,7 +1044,7 @@ if special in ("triple1", "triple6"):
         db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
 
         # prepare message
-        async def run_round_for_group(app, chat_id):
+async def run_round_for_group(app, chat_id):
     try:
         # --- logic xử lý vòng chơi ---
         # (tính result, winners, losers, settle tiền, v.v...)
