@@ -990,18 +990,18 @@ async def run_round_for_group(app: Application, chat_id: int):
 
         # --- Gửi tóm tắt cho admin (nếu cần) ---
 try:
-    if winners_paid:
-        admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
-        for uid, payout, amt in winners_paid:
-            admin_summary += f"- {uid}: đặt {int(amt):,} -> nhận {int(payout):,}\n"
-        for aid in ADMIN_IDS:
-            try:
-                await app.bot.send_message(chat_id=aid, text=admin_summary)
-            except Exception:
-                pass  # hoặc logger.exception("Admin summary send failed")
+        if winners_paid:
+            admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
+            for uid, payout, amt in winners_paid:
+                admin_summary += f"- {uid}: đặt {int(amt):,} -> nhận {int(payout):,}\n"
+            for aid in ADMIN_IDS:
+                try:
+                    await app.bot.send_message(chat_id=aid, text=admin_summary)
+                except Exception:
+                    logger.exception(f"Không gửi được admin summary cho admin {aid}")
 
-except Exception as e:
-    logger.exception("Exception in run_round_for_group")
+    except Exception as e:
+        logger.exception("Exception in run_round_for_group")
         # notify admins about fatal exception for this group
         for aid in ADMIN_IDS:
             try:
