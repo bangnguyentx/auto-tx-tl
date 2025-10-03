@@ -1009,6 +1009,7 @@ async def run_round_for_group(app: Application, chat_id: int):
                 pass
              
 # Reset streak for losers (atomic)
+# Reset streak for losers (atomic)
 for uid, amt in losers:
     try:
         db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
@@ -1020,24 +1021,24 @@ try:
     db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
 except Exception:
     logger.exception("Failed to delete bets for round after settlement")
-        # special triple distribute pot
-        # --- Special triple handling: chia pot cho winners tỉ lệ cược ---
-        special_msg = ""
-        try:
-            if special in ("triple1", "triple6"):
-                pot_amount = get_pot_amount()
-                if pot_amount > 0 and winners:
-                    total_bets_win = sum([amt for (_, amt) in winners]) or 0.0
-                    if total_bets_win > 0:
-                        for uid, amt in winners:
-                            share = (amt / total_bets_win) * pot_amount
-                            ensure_user(uid, "", "")
-                            u = get_user(uid)
-                            db_execute("UPDATE users SET balance = COALESCE(balance,0) + ? WHERE user_id=?", (share, uid))
-                        special_msg = f"Hũ {int(pot_amount):,}₫ đã được chia cho người thắng theo tỷ lệ cược!"
-                        reset_pot()
-        except Exception:
-            logger.exception("Error handling special triple")
+
+# special triple distribute pot
+special_msg = ""
+if special in ("triple1", "triple6"):
+    pot_amount = get_pot_amount()
+    if pot_amount > 0 and winners:
+        total_bets_win = sum([amt for (_, amt) in winners])
+        if total_bets_win > 0:
+            for uid, amt in winners:
+                share = (amt / total_bets_win) * pot_amount
+                ensure_user(uid, "", "")
+                u = get_user(uid)
+                db_execute(
+                    "UPDATE users SET balance=? WHERE user_id=?",
+                    ((u["balance"] or 0.0) + share, uid)
+                )
+            special_msg = f"Hũ {int(pot_amount):,}₫ đã được chia cho người thắng theo tỷ lệ cược!"
+            reset_pot()
 
         # clear bets
         db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
