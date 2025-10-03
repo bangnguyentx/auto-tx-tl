@@ -1008,44 +1008,36 @@ async def run_round_for_group(app: Application, chat_id: int):
             except Exception:
                 pass
              
-# Reset streak for losers (atomic)
-# Reset streak for losers (atomic)
-for uid, amt in losers:
-    try:
-        db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
-    except Exception:
-        logger.exception(f"Failed to reset streak for user {uid}")
-
-# Remove bets for this round (done after settlement)
-try:
-    db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
-except Exception:
-    logger.exception("Failed to delete bets for round after settlement")
-
-# special triple distribute pot
-special_msg = ""
-if special in ("triple1", "triple6"):
-    pot_amount = get_pot_amount()
-    if pot_amount > 0 and winners:
-        total_bets_win = sum([amt for (_, amt) in winners])
-        if total_bets_win > 0:
-            for uid, amt in winners:
-                share = (amt / total_bets_win) * pot_amount
-                ensure_user(uid, "", "")
-                u = get_user(uid)
-                db_execute(
-                    "UPDATE users SET balance=? WHERE user_id=?",
-                    ((u["balance"] or 0.0) + share, uid)
-                )
-            special_msg = f"Hũ {int(pot_amount):,}₫ đã được chia cho người thắng theo tỷ lệ cược!"
-            reset_pot()
-
-        # clear bets
-        db_execute("DELETE FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
-
-        # prepare message
 async def run_round_for_group(app, chat_id):
     try:
+        # ----- Lấy danh sách cược -----
+        bets = db_query("SELECT * FROM bets WHERE chat_id=? AND round_id=?", (chat_id, round_id))
+
+        # ----- Tính winners và losers -----
+        winners = []
+        losers = []
+        total_winner_bets = 0.0
+        total_loser_bets = 0.0
+
+        for b in bets:
+            if b["side"] == result:
+                winners.append((b["user_id"], b["amount"]))
+                total_winner_bets += float(b["amount"] or 0.0)
+            else:
+                losers.append((b["user_id"], b["amount"]))
+                total_loser_bets += float(b["amount"] or 0.0)
+
+        # ----- Reset streak cho losers -----
+        for uid, amt in losers:
+            try:
+                db_execute("UPDATE users SET current_streak=0 WHERE user_id=?", (uid,))
+            except Exception:
+                logger.exception(f"Failed to reset streak for user {uid}")
+
+        # (phần xử lý winners_paid, gửi tin nhắn,... ở dưới)
+
+    except Exception as e:
+        logger.exception(f"Exception in run_round_for_group: {e}")
         # --- logic xử lý vòng chơi ---
         # (tính result, winners, losers, settle tiền, v.v...)
 
