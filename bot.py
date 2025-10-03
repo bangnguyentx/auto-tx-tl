@@ -799,7 +799,7 @@ async def run_round_for_group(app: Application, chat_id: int, round_epoch: int):
         db_execute("INSERT INTO history(chat_id, round_index, round_id, result, dice, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
                    (chat_id, round_index, round_id, result, dice_str, now_iso()))
 
-        # ----- Compute winners/losers (robust/atomic updates) -----
+# ----- Compute winners/losers (robust/atomic updates) -----
 winners = []
 losers = []
 total_winner_bets = 0.0
@@ -841,7 +841,6 @@ for uid, amt in winners:
                 logger.exception("Failed to add house share to pot")
 
         # Update user's balance and streaks atomically
-        # Use COALESCE to handle possible NULLs
         try:
             db_execute(
                 """
@@ -864,18 +863,23 @@ for uid, amt in winners:
             new_balance = (u.get("balance") or 0) + payout
             new_cur = (u.get("current_streak") or 0) + 1
             new_best = max(u.get("best_streak") or 0, new_cur)
-            db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, new_cur, new_best, uid))
+            db_execute(
+                "UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?",
+                (new_balance, new_cur, new_best, uid)
+            )
 
         winners_paid.append((uid, int(payout), int(amt)))
     except Exception as e:
         logger.exception(f"Error paying winner {uid}: {e}")
-        # try notify admin about this particular payment error
         for aid in ADMIN_IDS:
             try:
-                app.bot.send_message(chat_id=aid, text=f"ERROR paying winner {uid} in group {chat_id}: {e}")
+                app.bot.send_message(
+                    chat_id=aid,
+                    text=f"ERROR paying winner {uid} in group {chat_id}: {e}"
+                )
             except Exception:
                 pass
-
+                
 # Reset streak for losers (atomic)
 for uid, amt in losers:
     try:
