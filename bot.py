@@ -940,38 +940,53 @@ async def rounds_loop(app: Application):
                     pass
 
 # -----------------------
-# Startup/Shutdown and main
+# Startup / Shutdown + Main entrypoint (PTB v20+ chuẩn)
 # -----------------------
+
 async def on_startup(app: Application):
+    """Hàm chạy khi bot khởi động."""
     logger.info("Bot starting up...")
     init_db()
+
     # notify admins
     for aid in ADMIN_IDS:
         try:
             await app.bot.send_message(chat_id=aid, text="✅ Bot đã khởi động và sẵn sàng.")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Không gửi được tin nhắn startup cho admin {aid}: {e}")
+
+    # chạy vòng quay tài xỉu nền
+    loop = asyncio.get_running_loop()
+    loop.create_task(rounds_loop(app))
+
 
 async def on_shutdown(app: Application):
+    """Hàm chạy khi bot shutdown."""
     logger.info("Bot shutting down...")
     for aid in ADMIN_IDS:
         try:
             await app.bot.send_message(chat_id=aid, text="⚠️ Bot đang tắt (shutdown).")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Không gửi được tin nhắn shutdown cho admin {aid}: {e}")
 
-async def main():
+
+def main():
+    """Main entrypoint — dùng run_polling() thay cho updater.start_polling()"""
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        print("ERROR: BOT_TOKEN not set. Please set BOT_TOKEN env variable.")
+        print("❌ ERROR: BOT_TOKEN not set. Please set BOT_TOKEN env variable.")
         return
 
+    # Khởi tạo database
     init_db()
+
+    # Tạo app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # register handlers
+    # ----- Đăng ký HANDLERS -----
+    # user
     app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("game", lambda u,c: game_info(u,c)))
-    app.add_handler(CommandHandler("nap", lambda u,c: nap_info(u,c)))
+    app.add_handler(CommandHandler("game", game_info))
+    app.add_handler(CommandHandler("nap", nap_info))
     app.add_handler(CommandHandler("ruttien", ruttien_handler))
     app.add_handler(CallbackQueryHandler(withdraw_callback_handler, pattern=r"^withdraw_.*|^withdraw.*"))
     app.add_handler(CallbackQueryHandler(callback_query_handler, pattern=r"^game_.*"))
@@ -992,41 +1007,53 @@ async def main():
     app.add_handler(CommandHandler("batdau", batdau_handler))
     app.add_handler(CallbackQueryHandler(approve_callback_handler, pattern=r"^(approve|deny)\|"))
 
-    # bets and private menu
+    # bets & private menu
     app.add_handler(MessageHandler(filters.Regex(r"^/[TtXx]\d+"), bet_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
 
-    # lifecycle
+    # lifecycle hooks
     app.post_init = on_startup
     app.post_shutdown = on_shutdown
 
-    # start
-    await app.initialize()
-    await app.start()
-
-    # kick off rounds loop
-    asyncio.create_task(rounds_loop(app))
-
-    # run polling
+    # ----- CHẠY BOT -----
     try:
-        await app.updater.start_polling()
-        await app.updater.idle()
-    finally:
-        await app.stop()
-        await app.shutdown()
+        logger.info("🚀 Bot starting... using run_polling()")
+        app.run_polling(poll_interval=1.0, timeout=20)
+    except Exception as e:
+        logger.exception(f"❌ Fatal error in main(): {e}")
+        # Notify admins nếu bot crash
+        for aid in ADMIN_IDS:
+            try:
+                app.bot.send_message(chat_id=aid, text=f"❌ Bot crashed: {e}")
+            except Exception:
+                pass
 
-# helper wrappers for simple commands used inline
+
+# -----------------------
+# Helper command wrappers
+# -----------------------
+
 async def game_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Game: Tài Xỉu (xúc xắc 3 con)\n- Tài: tổng 11-17\n- Xỉu: tổng 4-10\n- Phiên mỗi 60s\n- Đặt cược bằng /T<amount> hoặc /X<amount>\nLink nhóm: @VET789cc"
+        "🎲 *Game: Tài Xỉu (xúc xắc 3 con)*\n"
+        "- Tài: tổng 11–17\n"
+        "- Xỉu: tổng 4–10\n"
+        "- Mỗi phiên 60s\n"
+        "- Đặt cược bằng: /T<tiền> hoặc /X<tiền>\n"
+        "👉 Tham gia nhóm chơi: @VET789cc",
+        parse_mode="Markdown",
     )
 
-async def nap_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Để nạp tiền, liên hệ: @HOANGDUNGG789")
 
-# run as script
+async def nap_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💰 Để nạp tiền, liên hệ: @HOANGDUNGG789")
+
+
+# -----------------------
+# Run as script
+# -----------------------
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except Exception:
         logger.exception("Fatal error in main()")
