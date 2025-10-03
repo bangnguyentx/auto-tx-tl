@@ -1292,6 +1292,13 @@ async def run_round_for_group(app, chat_id, round_epoch):
             logger.exception("Failed to insert history")
 
         # ------- Tính winners/losers -------
+try:
+    # làm gì đó có thể lỗi
+    something()
+except Exception:
+    logger.exception("Lỗi trong đoạn trước khi tính winners")
+
+# ------- Tính winners/losers -------
 winners = []
 losers = []
 total_winner_bets = 0.0
