@@ -1058,6 +1058,9 @@ if special in ("triple1", "triple6"):
         except:
             logger.exception("Cannot send round result to group")
 
+async def run_round_for_group(app, chat_id):
+    try:
+        # --- logic xử lý vòng chơi ---
         # admin summary
         if winners_paid:
             admin_summary = f"Round {round_index} in group {chat_id} completed.\nResult: {result}\nWinners:\n"
@@ -1079,7 +1082,10 @@ if special in ("triple1", "triple6"):
         logger.exception("Exception in run_round_for_group")
         for aid in ADMIN_IDS:
             try:
-                await app.bot.send_message(chat_id=aid, text=f"ERROR - run_round_for_group exception for group {chat_id}: {e}\n{traceback.format_exc()}")
+                await app.bot.send_message(
+                    chat_id=aid,
+                    text=f"ERROR - run_round_for_group exception for group {chat_id}: {e}\n{traceback.format_exc()}"
+                )
             except:
                 pass
 
