@@ -888,15 +888,12 @@ async def run_round_for_group(app: Application, chat_id: int):
         except Exception:
             logger.exception("Failed to add losers to pot")
 
-        # --- Trả thưởng cho winners ---
+        # -------- TRẢ THƯỞNG --------
         winners_paid = []
         for uid, amt in winners:
             try:
-                # tính house share và payout
-                house_share = int(round(amt * HOUSE_RATE))
-                payout = int(round(amt * WIN_MULTIPLIER))
-
-                ensure_user(uid, "", "")
+                house_share = amt * HOUSE_RATE
+                payout = amt * WIN_MULTIPLIER
 
                 # cộng house share vào pot
                 if house_share > 0:
@@ -905,7 +902,10 @@ async def run_round_for_group(app: Application, chat_id: int):
                     except Exception:
                         logger.exception("Failed to add house share to pot")
 
-                # cập nhật balance và streak bằng 1 câu lệnh UPDATE (nếu DB SQLite hỗ trợ COALESCE)
+                # đảm bảo user tồn tại
+                ensure_user(uid, "", "")
+
+                # cộng tiền thưởng
                 try:
                     db_execute(
                         """
@@ -913,7 +913,7 @@ async def run_round_for_group(app: Application, chat_id: int):
                             balance = COALESCE(balance, 0) + ?,
                             current_streak = COALESCE(current_streak, 0) + 1,
                             best_streak = CASE
-                                WHEN COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
+                                COALESCE(current_streak, 0) + 1 > COALESCE(best_streak, 0)
                                 THEN COALESCE(current_streak, 0) + 1
                                 ELSE COALESCE(best_streak, 0)
                             END
@@ -922,15 +922,16 @@ async def run_round_for_group(app: Application, chat_id: int):
                         (payout, uid)
                     )
                 except Exception:
-                    # fallback: đọc rồi cập nhật
-                    logger.exception("Atomic update failed for user, falling back to read-then-write")
                     u = get_user(uid) or {"balance": 0, "current_streak": 0, "best_streak": 0}
                     new_balance = (u.get("balance") or 0) + payout
                     new_cur = (u.get("current_streak") or 0) + 1
                     new_best = max(u.get("best_streak") or 0, new_cur)
-                    db_execute("UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?", (new_balance, new_cur, new_best, uid))
+                    db_execute(
+                        "UPDATE users SET balance=?, current_streak=?, best_streak=? WHERE user_id=?",
+                        (new_balance, new_cur, new_best, uid)
+                    )
 
-                winners_paid.append((uid, payout, int(amt)))
+                winners_paid.append((uid, payout, amt))
             except Exception:
                 logger.exception(f"Error paying winner {uid}")
                 # thông báo admin nếu muốn
